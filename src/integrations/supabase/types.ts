@@ -14,7 +14,56 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      attendance: {
+        Row: {
+          attended_on: string
+          created_at: string
+          id: string
+          student_id: string
+        }
+        Insert: {
+          attended_on: string
+          created_at?: string
+          id?: string
+          student_id: string
+        }
+        Update: {
+          attended_on?: string
+          created_at?: string
+          id?: string
+          student_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "attendance_student_id_fkey"
+            columns: ["student_id"]
+            isOneToOne: false
+            referencedRelation: "students"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      students: {
+        Row: {
+          created_at: string
+          full_name: string
+          id: string
+          normalized_name: string
+        }
+        Insert: {
+          created_at?: string
+          full_name: string
+          id?: string
+          normalized_name: string
+        }
+        Update: {
+          created_at?: string
+          full_name?: string
+          id?: string
+          normalized_name?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
