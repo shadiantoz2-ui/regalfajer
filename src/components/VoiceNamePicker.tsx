@@ -64,11 +64,12 @@ export function VoiceNamePicker({
   );
 
   useEffect(() => {
-    if (!autoReset) return;
+    if (!autoReset) return undefined;
     if (phase.kind === "done" || phase.kind === "duplicate") {
       const t = window.setTimeout(() => setPhase({ kind: "idle" }), phase.kind === "done" ? 3500 : 5000);
       return () => window.clearTimeout(t);
     }
+    return undefined;
   }, [phase, autoReset]);
 
   const resolve = (heard: string) => {
