@@ -60,21 +60,36 @@ function ratio(a: string, b: string): number {
   return 1 - levenshtein(a, b) / max;
 }
 
-/** 0..1 score between what was heard and a stored name. */
+function firstLast(tokens: string[]): string {
+  return tokens.length >= 2 ? `${tokens[0]} ${tokens[tokens.length - 1]}` : tokens.join(" ");
+}
+
+/**
+ * 0..1 score between what was heard and a stored name.
+ * Names are "first name + family name", with the father's name optional in the middle,
+ * so "محمد العتيبي" and "محمد أحمد العتيبي" should still match.
+ */
 export function nameSimilarity(heard: string, stored: string): number {
   const h = normalizeName(heard);
   const s = normalizeName(stored);
   if (!h || !s) return 0;
   if (h === s) return 1;
   const full = ratio(h, s);
-  // The student may say only the first two names of the stored three.
   const hTokens = h.split(" ");
   const sTokens = s.split(" ");
-  let prefix = 0;
-  if (hTokens.length < sTokens.length) {
-    prefix = ratio(h, sTokens.slice(0, hTokens.length).join(" ")) * (hTokens.length >= 2 ? 0.92 : 0.7);
+  let partial = 0;
+  if (hTokens.length !== sTokens.length && hTokens.length >= 2 && sTokens.length >= 2) {
+    partial = ratio(firstLast(hTokens), firstLast(sTokens)) * 0.95;
   }
-  return Math.max(full, prefix);
+  return Math.max(full, partial);
+}
+
+/** True when two names likely belong to the same person (same first + family name). */
+export function sameFirstAndFamily(a: string, b: string): boolean {
+  const x = normalizeName(a).split(" ");
+  const y = normalizeName(b).split(" ");
+  if (x.length < 2 || y.length < 2) return false;
+  return firstLast(x) === firstLast(y);
 }
 
 export type NameMatch<T> = { item: T; score: number };

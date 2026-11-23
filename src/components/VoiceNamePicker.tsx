@@ -36,7 +36,7 @@ export function VoiceNamePicker({
   students,
   onConfirm,
   onRegister,
-  prompt = "اضغط على الزر وقل اسمك الثلاثي",
+  prompt = "اضغط على الزر وقل اسمك وكنيتك",
   successText = (n) => `تم تسجيل حضور ${n}`,
   duplicateText = (n) => `${n} مسجّل حضوره مسبقاً`,
   autoReset = true,
@@ -209,7 +209,7 @@ export function VoiceNamePicker({
                   autoFocus
                   value={typed}
                   onChange={(e) => setTyped(e.target.value)}
-                  placeholder="اكتب الاسم الثلاثي"
+                  placeholder="الاسم والكنية"
                   className="h-12 rounded-xl bg-background/40 text-base"
                 />
                 <Button type="submit" variant="gold" className="h-12 rounded-xl px-6">
@@ -277,7 +277,7 @@ export function VoiceNamePicker({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 className="mt-4 h-12 rounded-xl bg-background/40 text-center text-lg"
-                aria-label="الاسم الثلاثي للطالب الجديد"
+                aria-label="اسم الطالب الجديد وكنيته"
               />
               <div className="mt-4 grid grid-cols-2 gap-3">
                 <Button type="submit" variant="gold" size="xl" disabled={cleanDisplayName(newName).split(" ").length < 2}>

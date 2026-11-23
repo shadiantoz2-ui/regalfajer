@@ -14,6 +14,24 @@ export type Database = {
   }
   public: {
     Tables: {
+      app_settings: {
+        Row: {
+          id: number
+          results_public: boolean
+          updated_at: string
+        }
+        Insert: {
+          id?: number
+          results_public?: boolean
+          updated_at?: string
+        }
+        Update: {
+          id?: number
+          results_public?: boolean
+          updated_at?: string
+        }
+        Relationships: []
+      }
       attendance: {
         Row: {
           attended_on: string
@@ -64,15 +82,47 @@ export type Database = {
         }
         Relationships: []
       }
+      user_roles: {
+        Row: {
+          id: string
+          role: Database["public"]["Enums"]["app_role"]
+          user_id: string
+        }
+        Insert: {
+          id?: string
+          role: Database["public"]["Enums"]["app_role"]
+          user_id: string
+        }
+        Update: {
+          id?: string
+          role?: Database["public"]["Enums"]["app_role"]
+          user_id?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      has_role: {
+        Args: {
+          _role: Database["public"]["Enums"]["app_role"]
+          _user_id: string
+        }
+        Returns: boolean
+      }
+      is_staff: { Args: { _user_id: string }; Returns: boolean }
+      public_results: {
+        Args: never
+        Returns: {
+          days: number
+          full_name: string
+        }[]
+      }
     }
     Enums: {
-      [_ in never]: never
+      app_role: "admin" | "teacher"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -199,6 +249,8 @@ export type CompositeTypes<
 
 export const Constants = {
   public: {
-    Enums: {},
+    Enums: {
+      app_role: ["admin", "teacher"],
+    },
   },
 } as const

@@ -1,6 +1,5 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { useServerFn } from "@tanstack/react-start";
 import { Suspense, useEffect, useState } from "react";
 import { CalendarDays, Download, FileSpreadsheet, History, Loader2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -13,13 +12,13 @@ import {
   addStudent,
   dayAttendanceQuery,
   deleteAttendance,
-  exportAttendance,
+  fetchAllAttendance,
   recordAttendance,
   studentsQuery,
-} from "@/lib/attendance.functions";
+} from "@/lib/data";
 import { formatDateLong, localDateKey } from "@/lib/arabic";
 
-export const Route = createFileRoute("/records")({
+export const Route = createFileRoute("/_authenticated/records")({
   head: () => ({
     meta: [
       { title: "سجل الحضور والتحميل — رجال الفجر" },
@@ -30,6 +29,9 @@ export const Route = createFileRoute("/records")({
       { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
+  beforeLoad: ({ context }) => {
+    if (context.role !== "admin") throw redirect({ to: "/checkin" });
+  },
   loader: ({ context }) => context.queryClient.ensureQueryData(studentsQuery()),
   component: RecordsPage,
 });
@@ -55,11 +57,9 @@ function DateField({ id, label, value, onChange, max }: { id: string; label: str
 }
 
 function RecordsPage() {
+  const { role, userName } = Route.useRouteContext();
   const { data: students } = useSuspenseQuery(studentsQuery());
   const qc = useQueryClient();
-  const record = useServerFn(recordAttendance);
-  const add = useServerFn(addStudent);
-  const exportFn = useServerFn(exportAttendance);
 
   const [today, setToday] = useState("");
   const [pastDate, setPastDate] = useState("");
@@ -80,7 +80,11 @@ function RecordsPage() {
   const download = async () => {
     setExporting(true);
     try {
-      const data = await exportFn({ data: { ...(from ? { from } : {}), ...(to ? { to } : {}) } });
+      const [allStudents, attendance] = await Promise.all([
+        qc.fetchQuery({ ...studentsQuery(), staleTime: 0 }),
+        fetchAllAttendance(from || undefined, to || undefined),
+      ]);
+      const data = { students: allStudents, attendance };
       if (!data.students.length) {
         toast.error("لا يوجد طلاب لتحميل بياناتهم");
         return;
@@ -97,7 +101,7 @@ function RecordsPage() {
   };
 
   return (
-    <AppShell compact>
+    <AppShell compact role={role} userName={userName}>
       <section className="rounded-[2rem] p-6 surface">
         <h2 className="font-display flex items-center gap-2 text-2xl">
           <FileSpreadsheet className="size-6 text-primary" /> تحميل بيانات الحضور
@@ -127,16 +131,12 @@ function RecordsPage() {
           <VoiceNamePicker
             key={pastDate}
             students={students}
-            prompt="اضغط وقل اسم الطالب الثلاثي"
+            prompt="اضغط وقل اسم الطالب وكنيته"
             successText={(n) => `تم تسجيل حضور ${n} بتاريخ ${pastDate}`}
             duplicateText={(n) => `${n} مسجّل حضوره مسبقاً بتاريخ ${pastDate}`}
-            onConfirm={async (s) => {
-              const res = await record({ data: { student_id: s.id, date: pastDate } });
-              void qc.invalidateQueries({ queryKey: ["attendance", pastDate] });
-              return res.status === "duplicate" ? "duplicate" : "recorded";
-            }}
+            onConfirm={(s) => recordAttendance(qc, s, pastDate)}
             onRegister={async (name) => {
-              const res = await add({ data: { full_name: name } });
+              const res = await addStudent(name);
               void qc.invalidateQueries({ queryKey: ["students"] });
               if (res.status === "invalid") throw new Error("invalid");
               return res;
@@ -165,7 +165,6 @@ function RecordsPage() {
 function DayList({ date }: { date: string }) {
   const { data } = useSuspenseQuery(dayAttendanceQuery(date));
   const qc = useQueryClient();
-  const remove = useServerFn(deleteAttendance);
   return (
     <div className="mt-4">
       <div className="flex items-center justify-between">
@@ -186,7 +185,7 @@ function DayList({ date }: { date: string }) {
                 aria-label={`إلغاء حضور ${r.full_name}`}
                 className="text-muted-foreground hover:text-destructive"
                 onClick={async () => {
-                  await remove({ data: { id: r.id } });
+                  await deleteAttendance(r.id);
                   toast.success("تم إلغاء الحضور");
                   void qc.invalidateQueries({ queryKey: ["attendance", date] });
                 }}

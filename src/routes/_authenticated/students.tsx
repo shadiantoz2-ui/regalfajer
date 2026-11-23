@@ -1,6 +1,5 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { useServerFn } from "@tanstack/react-start";
 import { useMemo, useState, type FormEvent } from "react";
 import { AlertTriangle, ListPlus, Search, Trash2, UserPlus, Users } from "lucide-react";
 import { toast } from "sonner";
@@ -19,30 +18,31 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { addStudent, addStudentsBulk, deleteStudent, studentsQuery } from "@/lib/attendance.functions";
-import { cleanDisplayName, normalizeName } from "@/lib/arabic";
+import { addStudent, deleteStudent, studentsQuery } from "@/lib/data";
+import { cleanDisplayName, normalizeName, sameFirstAndFamily } from "@/lib/arabic";
 
-export const Route = createFileRoute("/students")({
+export const Route = createFileRoute("/_authenticated/students")({
   head: () => ({
     meta: [
       { title: "قائمة الطلاب — رجال الفجر" },
-      { name: "description", content: "إدخال وإدارة الأسماء الثلاثية لطلاب رجال الفجر." },
+      { name: "description", content: "إدخال وإدارة أسماء طلاب رجال الفجر." },
       { property: "og:title", content: "قائمة الطلاب — رجال الفجر" },
-      { property: "og:description", content: "إدخال وإدارة الأسماء الثلاثية لطلاب رجال الفجر." },
+      { property: "og:description", content: "إدخال وإدارة أسماء طلاب رجال الفجر." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
+  beforeLoad: ({ context }) => {
+    if (context.role !== "admin") throw redirect({ to: "/checkin" });
+  },
   loader: ({ context }) => context.queryClient.ensureQueryData(studentsQuery()),
   component: StudentsPage,
 });
 
 function StudentsPage() {
+  const { role, userName } = Route.useRouteContext();
   const { data: students } = useSuspenseQuery(studentsQuery());
   const qc = useQueryClient();
-  const add = useServerFn(addStudent);
-  const addBulk = useServerFn(addStudentsBulk);
-  const remove = useServerFn(deleteStudent);
 
   const [name, setName] = useState("");
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -51,8 +51,11 @@ function StudentsPage() {
   const [dupes, setDupes] = useState<string[]>([]);
   const [q, setQ] = useState("");
 
-  const existing = useMemo(() => new Map(students.map((s) => [normalizeName(s.full_name), s])), [students]);
-  const liveDuplicate = name.trim().length > 2 ? existing.get(normalizeName(name)) : undefined;
+  const exact = useMemo(() => new Map(students.map((s) => [normalizeName(s.full_name), s])), [students]);
+  const typed = name.trim().length > 2 ? name : "";
+  const exactDuplicate = typed ? exact.get(normalizeName(typed)) : undefined;
+  const similar = typed && !exactDuplicate ? students.find((s) => sameFirstAndFamily(s.full_name, typed)) : undefined;
+
   const filtered = useMemo(() => {
     const n = normalizeName(q);
     return n ? students.filter((s) => normalizeName(s.full_name).includes(n)) : students;
@@ -64,15 +67,14 @@ function StudentsPage() {
     e.preventDefault();
     const clean = cleanDisplayName(name);
     if (clean.split(" ").length < 2) {
-      toast.error("اكتب الاسم الثلاثي كاملاً");
+      toast.error("اكتب الاسم والكنية على الأقل");
       return;
     }
     setBusy(true);
     try {
-      const res = await add({ data: { full_name: clean } });
-      if (res.status === "duplicate") {
-        setDupes([clean]);
-      } else if (res.status === "created") {
+      const res = await addStudent(clean);
+      if (res.status === "duplicate") setDupes([clean]);
+      else if (res.status === "created") {
         toast.success(`تمت إضافة ${res.student.full_name}`);
         setName("");
         setDupes([]);
@@ -89,13 +91,19 @@ function StudentsPage() {
     const names = bulk
       .split(/\r?\n/)
       .map(cleanDisplayName)
-      .filter((n) => n.length >= 2);
+      .filter((n) => n.split(" ").length >= 2);
     if (!names.length) return;
     setBusy(true);
+    const created: string[] = [];
+    const duplicates: string[] = [];
     try {
-      const res = await addBulk({ data: { names } });
-      setDupes(res.duplicates);
-      if (res.created.length) toast.success(`تمت إضافة ${res.created.length} طالب`);
+      for (const n of names) {
+        const res = await addStudent(n);
+        if (res.status === "created") created.push(n);
+        else if (res.status === "duplicate") duplicates.push(n);
+      }
+      setDupes(duplicates);
+      if (created.length) toast.success(`تمت إضافة ${created.length} طالب`);
       setBulk("");
       setBulkOpen(false);
       await refresh();
@@ -107,11 +115,12 @@ function StudentsPage() {
   };
 
   return (
-    <AppShell compact>
+    <AppShell compact role={role} userName={userName}>
       <section className="rounded-[2rem] p-6 surface">
         <h2 className="font-display flex items-center gap-2 text-2xl">
           <UserPlus className="size-6 text-primary" /> إضافة طالب
         </h2>
+        <p className="mt-1 text-sm text-muted-foreground">الاسم والكنية، واسم الأب اختياري</p>
         <form onSubmit={submit} className="mt-4 flex flex-col gap-3 sm:flex-row">
           <Input
             value={name}
@@ -119,18 +128,23 @@ function StudentsPage() {
               setName(e.target.value);
               setDupes([]);
             }}
-            placeholder="الاسم الثلاثي، مثال: محمد أحمد العتيبي"
-            aria-invalid={!!liveDuplicate}
+            placeholder="مثال: محمد العتيبي أو محمد أحمد العتيبي"
+            aria-invalid={!!exactDuplicate || !!similar}
             className="h-12 flex-1 rounded-xl bg-background/40 text-base aria-[invalid=true]:border-destructive aria-[invalid=true]:ring-1 aria-[invalid=true]:ring-destructive"
           />
-          <Button type="submit" variant="gold" className="h-12 rounded-xl px-8" disabled={busy}>
+          <Button type="submit" variant="gold" className="h-12 rounded-xl px-8" disabled={busy || !!exactDuplicate}>
             إضافة
           </Button>
         </form>
 
-        {liveDuplicate && (
+        {exactDuplicate && (
           <p role="alert" className="mt-3 flex items-center gap-2 rounded-xl border border-destructive bg-destructive/15 px-4 py-3 text-destructive">
-            <AlertTriangle className="size-5 shrink-0" /> هذا الاسم مكرر: «{liveDuplicate.full_name}» موجود مسبقاً
+            <AlertTriangle className="size-5 shrink-0" /> اسم مكرر: «{exactDuplicate.full_name}» موجود مسبقاً
+          </p>
+        )}
+        {similar && (
+          <p role="alert" className="mt-3 flex items-center gap-2 rounded-xl border border-destructive bg-destructive/15 px-4 py-3 text-destructive">
+            <AlertTriangle className="size-5 shrink-0" /> تنبيه: يوجد طالب بنفس الاسم والكنية «{similar.full_name}». تأكد أنه شخص مختلف
           </p>
         )}
 
@@ -160,7 +174,7 @@ function StudentsPage() {
               value={bulk}
               onChange={(e) => setBulk(e.target.value)}
               rows={6}
-              placeholder={"اكتب كل اسم ثلاثي في سطر\nمحمد أحمد العتيبي\nخالد سعد القحطاني"}
+              placeholder={"اكتب كل اسم في سطر\nمحمد العتيبي\nخالد سعد القحطاني"}
               className="rounded-xl bg-background/40 text-base"
             />
             <Button variant="gold" className="mt-3 rounded-xl" onClick={submitBulk} disabled={busy}>
@@ -181,12 +195,7 @@ function StudentsPage() {
         </div>
         <div className="relative mt-4">
           <Search className="absolute top-1/2 right-3 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="ابحث عن طالب"
-            className="h-11 rounded-xl bg-background/40 pr-9"
-          />
+          <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="ابحث عن طالب" className="h-11 rounded-xl bg-background/40 pr-9" />
         </div>
         {filtered.length === 0 ? (
           <p className="mt-6 text-center text-muted-foreground">
@@ -214,9 +223,13 @@ function StudentsPage() {
                       <AlertDialogAction
                         className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                         onClick={async () => {
-                          await remove({ data: { id: s.id } });
-                          toast.success("تم الحذف");
-                          await refresh();
+                          try {
+                            await deleteStudent(s.id);
+                            toast.success("تم الحذف");
+                            await refresh();
+                          } catch {
+                            toast.error("تعذّر الحذف");
+                          }
                         }}
                       >
                         حذف

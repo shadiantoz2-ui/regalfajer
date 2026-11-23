@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findNameMatches, localDateKey, nameSimilarity, normalizeName, toEnglishDigits, formatDateLong } from "./arabic";
+import { sameFirstAndFamily, findNameMatches, localDateKey, nameSimilarity, normalizeName, toEnglishDigits, formatDateLong } from "./arabic";
 
 describe("Arabic name matching", () => {
   it("treats hamza, taa marbuta and tashkeel variants as the same name", () => {
@@ -22,6 +22,21 @@ describe("Arabic name matching", () => {
   it("does not match an unrelated name", () => {
     const students = [{ id: "1", full_name: "خالد سعد القحطاني" }];
     expect(findNameMatches("يوسف ناصر الدوسري", students)).toHaveLength(0);
+  });
+
+  it("matches name + family name when the father's name is left out", () => {
+    const students = [{ id: "1", full_name: "محمد أحمد العتيبي" }];
+    expect(findNameMatches("محمد العتيبي", students)[0]?.item.id).toBe("1");
+  });
+
+  it("matches a stored name + family name when the student also says the father's name", () => {
+    const students = [{ id: "1", full_name: "خالد القحطاني" }];
+    expect(findNameMatches("خالد سعد القحطاني", students)[0]?.item.id).toBe("1");
+  });
+
+  it("flags same first and family name as a likely duplicate", () => {
+    expect(sameFirstAndFamily("محمد العتيبي", "محمد أحمد العتيبي")).toBe(true);
+    expect(sameFirstAndFamily("محمد العتيبي", "محمد الشمري")).toBe(false);
   });
 
   it("scores identical names as 1", () => {

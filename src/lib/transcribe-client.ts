@@ -1,15 +1,23 @@
 import { createParser } from "eventsource-parser";
+import { supabase } from "@/integrations/supabase/client";
 
 /** Upload a recorded clip and read the streamed transcript to the end. */
 export async function transcribeAudio(file: File): Promise<string> {
   const form = new FormData();
   form.append("file", file, file.name);
-  const res = await fetch("/api/transcribe", { method: "POST", body: form });
+  const { data: session } = await supabase.auth.getSession();
+  const token = session.session?.access_token;
+  const res = await fetch("/api/transcribe", {
+    method: "POST",
+    body: form,
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
   if (!res.ok || !res.body) {
     let message = "تعذّر التعرف على الصوت، حاول مرة أخرى";
     try {
       const body = await res.json();
-      if (res.status === 402) message = "انتهى رصيد خدمة التعرف على الصوت";
+      if (res.status === 401) message = "انتهت الجلسة، سجّل الدخول من جديد";
+      else if (res.status === 402) message = "انتهى رصيد خدمة التعرف على الصوت";
       else if (res.status === 429) message = "طلبات كثيرة، انتظر لحظة ثم أعد المحاولة";
       else if (body?.error?.message && res.status !== 400) message = String(body.error.message);
     } catch {
