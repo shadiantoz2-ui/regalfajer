@@ -22,6 +22,13 @@
       "when": 1795431023929,
       "tag": "0002_migration",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795488741664,
+      "tag": "0003_assistant_chats",
+      "breakpoints": true
     }
   ]
 }

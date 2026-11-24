@@ -1,7 +1,7 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { CalendarClock, LogIn, LogOut, Mic, ShieldCheck, Trophy, Users } from "lucide-react";
+import { CalendarClock, LogIn, LogOut, MessageCircleQuestion, Mic, ShieldCheck, Trophy, Users } from "lucide-react";
 import logo from "@/assets/rijal-alfajr-logo.webp.asset.json";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
@@ -10,8 +10,9 @@ type Role = "admin" | "teacher" | null;
 
 const ALL_NAV = [
   { to: "/checkin", label: "الحضور", icon: Mic, roles: ["admin", "teacher"] },
-  { to: "/students", label: "الطلاب", icon: Users, roles: ["admin"] },
+  { to: "/students", label: "الطلاب", icon: Users, roles: ["admin", "teacher"] },
   { to: "/records", label: "السجل", icon: CalendarClock, roles: ["admin"] },
+  { to: "/assistant", label: "المساعد", icon: MessageCircleQuestion, roles: ["admin"] },
   { to: "/admin", label: "الإدارة", icon: ShieldCheck, roles: ["admin"] },
 ] as const;
 
@@ -83,8 +84,9 @@ export function AppShell({
           />
           <h1
             className={cn(
-              "font-display text-gradient-gold leading-tight",
-              compact ? "mt-1 text-3xl" : "mt-2 text-5xl md:text-6xl",
+              // Generous line height + bottom padding: gradient-clipped text otherwise cuts off the letters' tails.
+              "font-display text-gradient-gold leading-[1.6] pb-2",
+              compact ? "mt-0 text-3xl" : "mt-1 text-5xl md:text-6xl",
             )}
           >
             رجال الفجر

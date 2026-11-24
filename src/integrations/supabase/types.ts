@@ -32,6 +32,24 @@ export type Database = {
         }
         Relationships: []
       }
+      assistant_chats: {
+        Row: {
+          messages: Json
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          messages?: Json
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          messages?: Json
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       attendance: {
         Row: {
           attended_on: string

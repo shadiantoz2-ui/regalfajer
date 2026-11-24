@@ -100,6 +100,28 @@ export async function addStudent(rawName: string) {
   return { status: "created" as const, student: data as Student };
 }
 
+export type RenameResult = { status: "renamed" | "invalid" } | { status: "duplicate"; existing: string };
+
+/** Admin only (enforced by row-level rules). Same duplicate rule as adding. */
+export async function renameStudent(id: string, rawName: string): Promise<RenameResult> {
+  const full_name = cleanDisplayName(rawName);
+  const normalized_name = normalizeName(full_name);
+  if (!normalized_name || full_name.split(" ").length < 2) return { status: "invalid" };
+  const { error } = await supabase.from("students").update({ full_name, normalized_name }).eq("id", id);
+  if (error) {
+    if (error.code === UNIQUE_VIOLATION) {
+      const { data: existing } = await supabase
+        .from("students")
+        .select("full_name")
+        .eq("normalized_name", normalized_name)
+        .maybeSingle();
+      return { status: "duplicate", existing: existing?.full_name ?? full_name };
+    }
+    throw error;
+  }
+  return { status: "renamed" };
+}
+
 export async function deleteStudent(id: string) {
   const { error } = await supabase.from("students").delete().eq("id", id);
   if (error) throw error;
@@ -120,6 +142,23 @@ export async function recordAttendance(qc: QueryClient, student: Student, date: 
     old && !old.some((r) => r.id === data.id) ? [{ ...data, full_name: student.full_name }, ...old] : old,
   );
   return "recorded" as const;
+}
+
+/** Records many students for one date; students already recorded that day are skipped, never doubled. */
+export async function recordAttendanceBulk(qc: QueryClient, studentIds: string[], date: string) {
+  const ids = [...new Set(studentIds)];
+  if (!ids.length) return { recorded: 0, skipped: 0 };
+  const { data, error } = await supabase
+    .from("attendance")
+    .upsert(
+      ids.map((student_id) => ({ student_id, attended_on: date })),
+      { onConflict: "student_id,attended_on", ignoreDuplicates: true },
+    )
+    .select("id");
+  if (error) throw error;
+  const recorded = data?.length ?? 0;
+  await qc.invalidateQueries({ queryKey: ["attendance", date] });
+  return { recorded, skipped: ids.length - recorded };
 }
 
 export async function deleteAttendance(id: string) {
