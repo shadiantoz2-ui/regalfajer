@@ -1,5 +1,4 @@
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
-import { createClient } from "@supabase/supabase-js";
 import { createFileRoute } from "@tanstack/react-router";
 import {
   cleanDisplayName,
@@ -8,65 +7,11 @@ import {
   normalizeName,
   restoreArabicHamzaAndMadda,
 } from "@/lib/arabic";
-import { parseMockJwtUserId } from "@/integrations/supabase/mock";
-import type { Database } from "@/integrations/supabase/types";
-
-function isNewSupabaseApiKey(value: string): boolean {
-  return value.startsWith("sb_publishable_") || value.startsWith("sb_secret_");
-}
+import { resolveSession, verifySameOriginMutation } from "@/lib/server/auth.server";
 
 /** Only signed-in staff may use voice recognition. */
-async function isStaffRequest(request: Request): Promise<boolean> {
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (token.split(".").length !== 3) return false;
-  const url = process.env["SUPABASE_URL"];
-  const key = process.env["SUPABASE_PUBLISHABLE_KEY"];
-  if (!url || !key) return Boolean(parseMockJwtUserId(token));
-
-  const client = createClient<Database>(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    global: {
-      headers: { Authorization: `Bearer ${token}` },
-      fetch: (input, init) => {
-        const h = new Headers(
-          typeof Request !== "undefined" && input instanceof Request ? input.headers : undefined,
-        );
-        if (init?.headers) {
-          new Headers(init.headers).forEach((value, name) => h.set(name, value));
-        }
-        if (isNewSupabaseApiKey(key) && h.get("Authorization") === `Bearer ${key}`) {
-          h.delete("Authorization");
-        }
-        h.set("apikey", key);
-        return fetch(input, { ...init, headers: h });
-      },
-    },
-  });
-
-  let userId: string | undefined;
-  try {
-    const { data: claimsData } = await client.auth.getClaims(token);
-    userId = claimsData?.claims?.sub;
-  } catch {
-    /* fallback to getUser */
-  }
-  if (!userId) {
-    try {
-      const { data: userData } = await client.auth.getUser(token);
-      userId = userData.user?.id;
-    } catch {
-      return false;
-    }
-  }
-  if (!userId) return false;
-
-  try {
-    const { data } = await client.rpc("is_staff", { _user_id: userId });
-    return data === true;
-  } catch {
-    return false;
-  }
+function isStaffRequest(request: Request): boolean {
+  return resolveSession(request) !== null;
 }
 
 const MAX_BYTES = 10 * 1024 * 1024;
@@ -162,7 +107,10 @@ export const Route = createFileRoute("/api/transcribe")({
         return Response.json({ configured });
       },
       POST: async ({ request }) => {
-        if (!(await isStaffRequest(request))) {
+        if (!verifySameOriginMutation(request)) {
+          return Response.json({ error: { message: "طلب غير مصرّح به" } }, { status: 403 });
+        }
+        if (!isStaffRequest(request)) {
           return Response.json({ error: { message: "انتهت الجلسة، سجّل الدخول أولاً" } }, { status: 401 });
         }
 
@@ -213,7 +161,7 @@ export const Route = createFileRoute("/api/transcribe")({
               },
               {
                 text: [
-                  "Listen carefully to this Arabic audio clip where a student says their full name (1 to 5 words).",
+                  "Listen carefully to this Arabic audio clip where a student says their name and family name (first name may be compound such as محمد أمين or عبد الكريم, with no father's name).",
                   "Transcribe ONLY the exact spoken Arabic name in clean standard Arabic script.",
                   "Pay strict attention to Arabic hamzas (أ، إ، ؤ، ئ، ء) and madda (آ), e.g. أحمد، إبراهيم، أسامة، آدم، آلاء، آل علي، فؤاد، مؤمن، وائل، رائد، علاء، أسماء.",
                   "Do NOT add harakat/tashkeel, punctuation, prefixes, explanations, or repeated words.",
@@ -274,7 +222,7 @@ export const Route = createFileRoute("/api/transcribe")({
         upstream.append("language", "ar");
         upstream.append(
           "prompt",
-          "طالب يقول اسمه الثلاثي باللغة العربية الفصحى مع كتابة الهمزات والمدّات بشكل صحيح، مثل: أحمد إبراهيم العتيبي، آدم فؤاد آل علي. اكتب الاسم فقط دون تكرار.",
+          "طالب يقول اسمه وكنيته باللغة العربية الفصحى (قد يكون الاسم مركباً مثل محمد أمين أو عبد الكريم، بدون اسم أب) مع كتابة الهمزات والمدّات بشكل صحيح، مثل: أسامة العلاوي، محمد أمين الزهوري. اكتب الاسم فقط دون تكرار.",
         );
 
         const res = await fetch("https://ai.gateway.lovable.dev/v1/audio/transcriptions", {

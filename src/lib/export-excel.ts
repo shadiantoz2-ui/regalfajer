@@ -22,7 +22,7 @@ export async function downloadAttendanceExcel(students: Student[], attendance: A
   const grid = wb.addWorksheet("جدول الحضور", { views: [{ rightToLeft: true, state: "frozen", xSplit: 3, ySplit: 1 }] });
   grid.columns = [
     { header: "#", key: "n", width: 6 },
-    { header: "الاسم الثلاثي", key: "name", width: 32 },
+    { header: "الاسم والكنية", key: "name", width: 32 },
     { header: "عدد أيام الحضور", key: "total", width: 16 },
     ...dates.map((d) => ({ header: `${formatDateShort(d)}\n${d}`, key: d, width: 14 })),
   ];
@@ -48,7 +48,7 @@ export async function downloadAttendanceExcel(students: Student[], attendance: A
   const list = wb.addWorksheet("أيام حضور كل طالب", { views: [{ rightToLeft: true }] });
   list.columns = [
     { header: "#", key: "n", width: 6 },
-    { header: "الاسم الثلاثي", key: "name", width: 32 },
+    { header: "الاسم والكنية", key: "name", width: 32 },
     { header: "عدد الأيام", key: "total", width: 12 },
     { header: "الأيام التي حضر بها", key: "days", width: 90 },
   ];

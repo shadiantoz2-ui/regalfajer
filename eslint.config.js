@@ -1,4 +1,5 @@
 import js from "@eslint/js";
+import firebaseRulesPlugin from "@firebase/eslint-plugin-security-rules";
 import eslintPluginPrettier from "eslint-plugin-prettier/recommended";
 import globals from "globals";
 import reactHooks from "eslint-plugin-react-hooks";
@@ -6,7 +7,7 @@ import reactRefresh from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", ".output", ".vinxi"] },
+  { ignores: ["dist/**", ".output/**", ".vinxi/**"] },
   {
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     files: ["**/*.{ts,tsx}"],
@@ -36,5 +37,9 @@ export default tseslint.config(
       "@typescript-eslint/no-unused-vars": "off",
     },
   },
-  eslintPluginPrettier,
+  {
+    ...eslintPluginPrettier,
+    files: ["**/*.{ts,tsx,js,mjs,cjs}"],
+  },
+  firebaseRulesPlugin.configs["flat/recommended"],
 );

@@ -1,11 +1,24 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useServerFn } from "@tanstack/react-start";
 import { useMemo, useState, type FormEvent } from "react";
-import { AlertTriangle, CalendarDays, ListPlus, Loader2, Pencil, Search, Trash2, UserPlus, Users } from "lucide-react";
+import {
+  AlertTriangle,
+  CalendarDays,
+  CalendarPlus,
+  ListPlus,
+  Loader2,
+  Pencil,
+  Plus,
+  Search,
+  Trash2,
+  UserPlus,
+  Users,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 import { AppShell } from "@/components/AppShell";
 import { Button } from "@/components/ui/button";
+import { Calendar } from "@/components/ui/calendar";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -25,12 +38,21 @@ import {
   deleteStudent,
   recordAttendance,
   recordAttendanceBulk,
+  recordStudentPastDates,
   renameStudent,
   studentAttendanceQuery,
   studentsQuery,
 } from "@/lib/data";
-import { cleanDisplayName, formatDateLong, localDateKey, normalizeName, sameFirstAndFamily } from "@/lib/arabic";
-import { recordStaffCheckin } from "@/lib/staff.functions";
+import {
+  cleanDisplayName,
+  formatDateLong,
+  formatDateShort,
+  localDateKey,
+  normalizeName,
+  parseDateKey,
+  sameFirstAndFamily,
+  toEnglishDigits,
+} from "@/lib/arabic";
 import type { Student } from "@/lib/types";
 
 export const Route = createFileRoute("/_authenticated/students")({
@@ -55,7 +77,6 @@ function StudentsPage() {
   const studentsResult = useQuery({ ...studentsQuery(), enabled: isAdmin });
   const students = useMemo(() => studentsResult.data ?? [], [studentsResult.data]);
   const qc = useQueryClient();
-  const logCheckin = useServerFn(recordStaffCheckin);
 
   const [name, setName] = useState("");
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -73,12 +94,31 @@ function StudentsPage() {
   const [editError, setEditError] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
 
+  const [pastDatesStudent, setPastDatesStudent] = useState<Student | null>(null);
+  const [selectedPastDateKeys, setSelectedPastDateKeys] = useState<string[]>([]);
+  const [manualPastDate, setManualPastDate] = useState("");
+  const [savingPastDates, setSavingPastDates] = useState(false);
+
   const today = localDateKey();
 
   const studentAttendance = useQuery({
     ...studentAttendanceQuery(selectedStudent?.id ?? ""),
     enabled: isAdmin && !!selectedStudent,
   });
+
+  const pastDatesAttendance = useQuery({
+    ...studentAttendanceQuery(pastDatesStudent?.id ?? ""),
+    enabled: isAdmin && !!pastDatesStudent,
+  });
+
+  const recordedPastDateSet = useMemo(
+    () => new Set((pastDatesAttendance.data ?? []).map((r) => r.attended_on)),
+    [pastDatesAttendance.data],
+  );
+  const recordedPastDateObjects = useMemo(
+    () => Array.from(recordedPastDateSet).map((d) => parseDateKey(d)),
+    [recordedPastDateSet],
+  );
 
   const exact = useMemo(() => new Map(students.map((s) => [normalizeName(s.full_name), s])), [students]);
   const typed = isAdmin && name.trim().length > 2 ? name : "";
@@ -104,6 +144,48 @@ function StudentsPage() {
     setEditingStudent(student);
     setEditName(student.full_name);
     setEditError("");
+  };
+
+  const openPastDates = (student: Student) => {
+    setSelectedStudent(null);
+    setPastDatesStudent(student);
+    setSelectedPastDateKeys([]);
+    setManualPastDate("");
+  };
+
+  const addManualPastDate = () => {
+    if (!manualPastDate) return;
+    if (manualPastDate > today) {
+      toast.error("لا يمكن تسجيل حضور بتاريخ مستقبلي");
+      return;
+    }
+    if (recordedPastDateSet.has(manualPastDate)) {
+      toast.info(`هذا اليوم (${manualPastDate}) مسجّل للطالب مسبقاً`);
+      return;
+    }
+    setSelectedPastDateKeys((prev) =>
+      prev.includes(manualPastDate) ? prev : [...prev, manualPastDate].sort((a, b) => a.localeCompare(b)),
+    );
+    setManualPastDate("");
+  };
+
+  const savePastDates = async () => {
+    if (!pastDatesStudent || selectedPastDateKeys.length === 0) return;
+    setSavingPastDates(true);
+    try {
+      const res = await recordStudentPastDates(qc, pastDatesStudent, selectedPastDateKeys, today);
+      if (res.recorded === 0) {
+        toast.info("جميع التواريخ المحددة مسجّلة لهذا الطالب مسبقاً");
+      } else {
+        toast.success(`تم تسجيل حضور ${pastDatesStudent.full_name} لـ ${res.recorded} ${res.recorded === 1 ? "يوم" : "أيام"}`);
+      }
+      setPastDatesStudent(null);
+      setSelectedPastDateKeys([]);
+    } catch {
+      toast.error("تعذّر تسجيل أيام الحضور، حاول مرة أخرى");
+    } finally {
+      setSavingPastDates(false);
+    }
   };
 
   const submit = async (e: FormEvent) => {
@@ -169,14 +251,7 @@ function StudentsPage() {
         const target = pendingTodayAttendance[0];
         const res = await recordAttendance(qc, target, today);
         if (res === "duplicate") toast.info(`${target.full_name} مسجّل حضوره اليوم مسبقاً`);
-        else {
-          toast.success(`تم تسجيل حضور ${target.full_name} لهذا اليوم`);
-          try {
-            await logCheckin({ data: { studentId: target.id, studentName: target.full_name, attendedOn: today } });
-          } catch {
-            /* attendance already persisted */
-          }
-        }
+        else toast.success(`تم تسجيل حضور ${target.full_name} لهذا اليوم`);
         void qc.invalidateQueries({ queryKey: ["student-attendance", target.id] });
       } else {
         const { recorded } = await recordAttendanceBulk(
@@ -185,13 +260,6 @@ function StudentsPage() {
           today,
         );
         toast.success(`تم تسجيل حضور ${recorded} طالب لهذا اليوم`);
-        for (const s of pendingTodayAttendance) {
-          try {
-            await logCheckin({ data: { studentId: s.id, studentName: s.full_name, attendedOn: today } });
-          } catch {
-            /* best-effort attribution */
-          }
-        }
         void qc.invalidateQueries({ queryKey: ["student-attendance"] });
       }
       await qc.invalidateQueries({ queryKey: ["attendance", today] });
@@ -247,7 +315,9 @@ function StudentsPage() {
         <h2 className="font-display flex items-center gap-2 text-2xl">
           <UserPlus className="size-6 text-primary" /> إضافة طالب
         </h2>
-        <p className="mt-1 text-sm text-muted-foreground">الاسم والكنية، واسم الأب اختياري</p>
+        <p className="mt-1 text-sm text-muted-foreground">
+          الاسم والكنية فقط (بدون اسم أب؛ قد يكون الاسم مركباً مثل محمد أمين أو عبد الكريم)
+        </p>
         <form onSubmit={submit} className="mt-4 flex flex-col gap-3 sm:flex-row">
           <Input
             value={name}
@@ -255,8 +325,8 @@ function StudentsPage() {
               setName(e.target.value);
               setDupes([]);
             }}
-            placeholder="مثال: محمد العتيبي أو محمد أحمد العتيبي"
-            aria-invalid={!!exactDuplicate || !!similar}
+            placeholder="مثال: محمد العتيبي أو محمد أمين الزهوري"
+            aria-invalid={!!exactDuplicate}
             className="h-12 flex-1 rounded-xl bg-background/40 text-base aria-[invalid=true]:border-destructive aria-[invalid=true]:ring-1 aria-[invalid=true]:ring-destructive"
           />
           <Button type="submit" variant="gold" className="h-12 rounded-xl px-8" disabled={busy || !!exactDuplicate}>
@@ -270,8 +340,8 @@ function StudentsPage() {
           </p>
         )}
         {similar && (
-          <p role="alert" className="mt-3 flex items-center gap-2 rounded-xl border border-destructive bg-destructive/15 px-4 py-3 text-destructive">
-            <AlertTriangle className="size-5 shrink-0" /> تنبيه: يوجد طالب بنفس الاسم والكنية «{similar.full_name}». تأكد أنه شخص مختلف
+          <p role="status" className="mt-3 flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-3 text-sm text-foreground">
+            <AlertTriangle className="size-5 shrink-0 text-primary" /> ملاحظة: يوجد طالب آخر بنفس الاسم الأول والكنية «{similar.full_name}». إذا كان الاسم مركباً (مثل محمد أمين) فسيُضاف كطالب مستقل.
           </p>
         )}
 
@@ -301,7 +371,7 @@ function StudentsPage() {
               value={bulk}
               onChange={(e) => setBulk(e.target.value)}
               rows={6}
-              placeholder={"اكتب كل اسم في سطر\nمحمد العتيبي\nخالد سعد القحطاني"}
+              placeholder={"اكتب كل اسم في سطر (الاسم والكنية فقط)\nمحمد العتيبي\nمحمد أمين الزهوري"}
               className="rounded-xl bg-background/40 text-base"
             />
             <Button variant="gold" className="mt-3 rounded-xl" onClick={submitBulk} disabled={busy}>
@@ -346,6 +416,18 @@ function StudentsPage() {
                       التفاصيل
                     </span>
                   </button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-label={`تسجيل أيام حضور سابقة للطالب ${s.full_name}`}
+                    title="تسجيل عدة أيام حضور سابقة"
+                    onClick={() => openPastDates(s)}
+                    className="h-9 shrink-0 gap-1.5 rounded-xl px-2.5 text-primary hover:bg-primary/15 hover:text-primary"
+                  >
+                    <CalendarPlus className="size-4" />
+                    <span className="hidden text-xs font-medium sm:inline">تسجيل أيام</span>
+                  </Button>
                   <Button
                     variant="ghost"
                     size="icon"
@@ -469,9 +551,14 @@ function StudentsPage() {
 
             <DialogFooter className="gap-2 sm:justify-start">
               {selectedStudent && (
-                <Button type="button" variant="gold" onClick={() => openEdit(selectedStudent)}>
-                  <Pencil className="size-4" /> تعديل الاسم
-                </Button>
+                <>
+                  <Button type="button" variant="gold" onClick={() => openPastDates(selectedStudent)}>
+                    <CalendarPlus className="size-4" /> تسجيل أيام سابقة
+                  </Button>
+                  <Button type="button" variant="glass" onClick={() => openEdit(selectedStudent)}>
+                    <Pencil className="size-4" /> تعديل الاسم
+                  </Button>
+                </>
               )}
               <Button type="button" variant="glass" onClick={() => setSelectedStudent(null)}>
                 إغلاق
@@ -520,6 +607,143 @@ function StudentsPage() {
                 </Button>
               </DialogFooter>
             </form>
+          </DialogContent>
+        </Dialog>
+      )}
+      {isAdmin && (
+        <Dialog open={!!pastDatesStudent} onOpenChange={(open) => !open && !savingPastDates && setPastDatesStudent(null)}>
+          <DialogContent dir="rtl" className="max-h-[90dvh] overflow-y-auto rounded-[2rem] border-border surface sm:max-w-lg">
+            <DialogHeader className="pe-8 text-right sm:text-right">
+              <DialogTitle className="font-display text-2xl text-gradient-gold">
+                تسجيل أيام حضور سابقة
+              </DialogTitle>
+              <DialogDescription>
+                اختر يوماً أو عدة أيام لتسجيل حضور «{pastDatesStudent?.full_name}». الأيام المظللة بالأخضر مسجّلة مسبقاً.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="flex flex-col items-center gap-4">
+              <div className="w-full overflow-x-auto rounded-2xl border border-border bg-background/40 p-3 flex justify-center">
+                <Calendar
+                  mode="multiple"
+                  dir="rtl"
+                  selected={selectedPastDateKeys.map((k) => parseDateKey(k))}
+                  onSelect={(dates) => {
+                    const next = Array.from(
+                      new Set(
+                        (dates ?? [])
+                          .map((d) => localDateKey(d))
+                          .filter((k) => k <= today && !recordedPastDateSet.has(k)),
+                      ),
+                    ).sort((a, b) => a.localeCompare(b));
+                    setSelectedPastDateKeys(next);
+                  }}
+                  disabled={(date) => {
+                    const k = localDateKey(date);
+                    return k > today || recordedPastDateSet.has(k);
+                  }}
+                  modifiers={{ recorded: recordedPastDateObjects }}
+                  modifiersClassNames={{
+                    recorded:
+                      "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40 rounded-md opacity-100",
+                  }}
+                  formatters={{
+                    formatCaption: (d) =>
+                      toEnglishDigits(d.toLocaleDateString("ar-u-nu-latn", { month: "long", year: "numeric" })),
+                    formatWeekdayName: (d) =>
+                      toEnglishDigits(d.toLocaleDateString("ar-u-nu-latn", { weekday: "narrow" })),
+                  }}
+                  className="bg-transparent"
+                />
+              </div>
+
+              <div className="flex w-full items-center gap-2">
+                <Input
+                  type="date"
+                  dir="ltr"
+                  lang="en"
+                  value={manualPastDate}
+                  max={today}
+                  onChange={(e) => setManualPastDate(e.target.value)}
+                  aria-label="إضافة تاريخ محدد"
+                  className="h-11 flex-1 rounded-xl bg-background/40 text-center"
+                />
+                <Button
+                  type="button"
+                  variant="glass"
+                  onClick={addManualPastDate}
+                  disabled={!manualPastDate || savingPastDates}
+                  className="h-11 shrink-0 rounded-xl px-4"
+                >
+                  <Plus className="size-4" /> إضافة تاريخ
+                </Button>
+              </div>
+
+              <div className="w-full rounded-2xl border border-border bg-background/30 p-3">
+                <div className="flex items-center justify-between gap-2 text-sm">
+                  <span className="font-medium text-foreground">
+                    الأيام المحددة ({selectedPastDateKeys.length})
+                  </span>
+                  {selectedPastDateKeys.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedPastDateKeys([])}
+                      disabled={savingPastDates}
+                      className="cursor-pointer text-xs text-muted-foreground hover:text-destructive"
+                    >
+                      مسح التحديد
+                    </button>
+                  )}
+                </div>
+                {selectedPastDateKeys.length === 0 ? (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    اضغط على التواريخ في التقويم أعلاه لتحديد يوم أو أكثر.
+                  </p>
+                ) : (
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    {selectedPastDateKeys.map((k) => (
+                      <span
+                        key={k}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-primary/40 bg-primary/15 px-2.5 py-1 text-xs font-medium text-foreground"
+                      >
+                        <span>{formatDateShort(k)}</span>
+                        <span className="text-[11px] text-muted-foreground" dir="ltr">
+                          ({k})
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={`إزالة ${k}`}
+                          onClick={() => setSelectedPastDateKeys((prev) => prev.filter((item) => item !== k))}
+                          className="cursor-pointer text-muted-foreground hover:text-destructive"
+                        >
+                          <X className="size-3.5" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <DialogFooter className="gap-2 sm:justify-start">
+              <Button
+                type="button"
+                variant="gold"
+                disabled={savingPastDates || selectedPastDateKeys.length === 0}
+                onClick={() => void savePastDates()}
+              >
+                {savingPastDates ? <Loader2 className="size-4 animate-spin" /> : <CalendarPlus className="size-4" />}
+                حفظ الحضور ({selectedPastDateKeys.length})
+              </Button>
+              <Button
+                type="button"
+                variant="glass"
+                disabled={savingPastDates}
+                onClick={() => setPastDatesStudent(null)}
+              >
+                إلغاء
+              </Button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       )}

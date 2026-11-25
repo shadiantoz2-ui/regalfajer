@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { CalendarClock, LogIn, LogOut, MessageCircleQuestion, Mic, ShieldCheck, Trophy, UserPlus, Users } from "lucide-react";
 import { AlGhufranLogo } from "@/components/AlGhufranLogo";
-import { supabase } from "@/integrations/supabase/client";
+import { logoutSession } from "@/lib/data";
 import { cn } from "@/lib/utils";
 
 type Role = "admin" | "teacher" | null;
@@ -37,8 +37,8 @@ export function AppShell({
 
   const signOut = async () => {
     await qc.cancelQueries();
+    await logoutSession().catch(() => {});
     qc.clear();
-    await supabase.auth.signOut();
     navigate({ to: "/auth", replace: true });
   };
 

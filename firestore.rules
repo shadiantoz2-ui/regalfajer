@@ -1,0 +1,363 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Primitive Helpers ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSignedInUser() {
+      return isSignedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email.size() >= 3;
+    }
+
+    function callerEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    function emailDocKey(email) {
+      return email.lower().replace('[^a-z0-9]', '_');
+    }
+
+    function hasStaffProfile(uid) {
+      return exists(/databases/$(database)/documents/staff_profiles/$(uid));
+    }
+
+    function getStaffProfile(uid) {
+      return get(/databases/$(database)/documents/staff_profiles/$(uid)).data;
+    }
+
+    function isPrimaryBootstrapAdmin(uid) {
+      return exists(/databases/$(database)/documents/app_settings/bootstrap)
+        && get(/databases/$(database)/documents/app_settings/bootstrap).data.adminUid == uid;
+    }
+
+    // One-time atomic claim when /app_settings/bootstrap does not yet exist.
+    function isInitialAdminBootstrap() {
+      return isSignedInUser()
+        && !exists(/databases/$(database)/documents/app_settings/bootstrap)
+        && existsAfter(/databases/$(database)/documents/app_settings/bootstrap)
+        && getAfter(/databases/$(database)/documents/app_settings/bootstrap).data.initialized == true
+        && getAfter(/databases/$(database)/documents/app_settings/bootstrap).data.adminUid == request.auth.uid;
+    }
+
+    function isAdmin() {
+      return isSignedInUser()
+        && hasStaffProfile(request.auth.uid)
+        && getStaffProfile(request.auth.uid).role == 'admin';
+    }
+
+    function isTeacher() {
+      return isSignedInUser()
+        && hasStaffProfile(request.auth.uid)
+        && getStaffProfile(request.auth.uid).role == 'teacher';
+    }
+
+    function isStaff() {
+      return isAdmin() || isTeacher();
+    }
+
+    // --- Entity Validation Blueprints ---
+    function isValidStaffAccount(data) {
+      return data.keys().hasAll(['name', 'email', 'role', 'uid', 'status', 'createdAt', 'updatedAt', 'createdByUid'])
+        && data.keys().hasOnly(['name', 'email', 'role', 'uid', 'status', 'createdAt', 'updatedAt', 'createdByUid'])
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 150
+        && data.email.matches('^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$')
+        && data.role in ['admin', 'teacher']
+        && data.uid is string && data.uid.size() <= 128
+        && data.status in ['pending', 'active']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128;
+    }
+
+    function isValidStaffProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'name', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'name', 'role', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid.size() >= 1 && data.uid.size() <= 128
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 150
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.role in ['admin', 'teacher']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBootstrapConfig(data) {
+      return data.keys().hasAll(['initialized', 'adminUid', 'createdAt'])
+        && data.keys().hasOnly(['initialized', 'adminUid', 'createdAt'])
+        && data.initialized == true
+        && data.adminUid is string && data.adminUid == request.auth.uid && data.adminUid.size() >= 1 && data.adminUid.size() <= 128
+        && data.createdAt is timestamp;
+    }
+
+    function isValidStudent(data) {
+      return data.keys().hasAll(['full_name', 'normalized_name', 'createdAt', 'updatedAt', 'createdByUid'])
+        && data.keys().hasOnly(['full_name', 'normalized_name', 'createdAt', 'updatedAt', 'createdByUid'])
+        && data.full_name is string && data.full_name.size() >= 2 && data.full_name.size() <= 120
+        && data.normalized_name is string && data.normalized_name.size() >= 2 && data.normalized_name.size() <= 120
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128;
+    }
+
+    function isValidAttendance(data) {
+      return data.keys().hasAll([
+          'student_id',
+          'student_name',
+          'attended_on',
+          'recorded_by_uid',
+          'recorded_by_name',
+          'recorded_by_email',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'student_id',
+          'student_name',
+          'attended_on',
+          'recorded_by_uid',
+          'recorded_by_name',
+          'recorded_by_email',
+          'createdAt'
+        ])
+        && isValidId(data.student_id)
+        && data.student_name is string && data.student_name.size() >= 2 && data.student_name.size() <= 120
+        && data.attended_on is string && data.attended_on.size() == 10 && data.attended_on.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && data.recorded_by_uid is string && data.recorded_by_uid == request.auth.uid && data.recorded_by_uid.size() >= 1 && data.recorded_by_uid.size() <= 128
+        && data.recorded_by_name is string && data.recorded_by_name.size() >= 1 && data.recorded_by_name.size() <= 80
+        && data.recorded_by_email is string && data.recorded_by_email.size() >= 3 && data.recorded_by_email.size() <= 150
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAppSettings(data) {
+      return data.keys().hasAll(['results_public', 'updatedAt', 'updatedByUid'])
+        && data.keys().hasOnly(['results_public', 'updatedAt', 'updatedByUid'])
+        && data.results_public is bool
+        && data.updatedAt is timestamp
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && data.updatedByUid.size() >= 1 && data.updatedByUid.size() <= 128;
+    }
+
+    function isValidPublicResults(data) {
+      return data.keys().hasAll(['results_public', 'rows', 'updatedAt', 'updatedByUid'])
+        && data.keys().hasOnly(['results_public', 'rows', 'updatedAt', 'updatedByUid'])
+        && data.results_public is bool
+        && data.rows is list && data.rows.size() <= 1000
+        && (
+          data.rows.size() == 0
+          || (
+            data.rows[0] is map
+            && data.rows[0].keys().hasAll(['full_name', 'days'])
+            && data.rows[0].keys().hasOnly(['full_name', 'days'])
+            && data.rows[0].full_name is string && data.rows[0].full_name.size() >= 1 && data.rows[0].full_name.size() <= 120
+            && data.rows[0].days is number && data.rows[0].days >= 0
+          )
+        )
+        && data.updatedAt is timestamp
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && data.updatedByUid.size() >= 1 && data.updatedByUid.size() <= 128;
+    }
+
+    function isValidAssistantChat(data, userId) {
+      return data.keys().hasAll(['user_id', 'messages', 'updatedAt'])
+        && data.keys().hasOnly(['user_id', 'messages', 'updatedAt'])
+        && data.user_id is string && data.user_id == userId && data.user_id.size() >= 1 && data.user_id.size() <= 128
+        && data.messages is list && data.messages.size() <= 200
+        && data.updatedAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    // Connection test document
+    match /test/connection {
+      allow get: if true;
+      allow list, write: if false;
+    }
+
+    // Staff accounts: managed exclusively by admins (plus one-time atomic first-admin bootstrap).
+    match /staff_accounts/{accountId} {
+      allow get: if isValidId(accountId) && (
+        isAdmin()
+        || (isSignedInUser() && accountId == emailDocKey(callerEmail()))
+      );
+      allow list: if isAdmin();
+      allow create: if isValidId(accountId)
+        && isSignedInUser()
+        && isValidStaffAccount(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && incoming().createdByUid == request.auth.uid
+        && accountId == emailDocKey(incoming().email)
+        && (
+          isAdmin()
+          || (
+            isInitialAdminBootstrap()
+            && incoming().email == callerEmail()
+            && incoming().uid == request.auth.uid
+            && incoming().status == 'active'
+            && incoming().role == 'admin'
+          )
+        );
+      allow update: if isValidId(accountId)
+        && isAdmin()
+        && isValidStaffAccount(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().email == existing().email
+        && incoming().uid == existing().uid
+        && incoming().updatedAt == request.time
+        && (!isPrimaryBootstrapAdmin(existing().uid) || incoming().role == 'admin')
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'role', 'status', 'updatedAt']);
+      allow delete: if isValidId(accountId)
+        && isAdmin()
+        && existing().uid != request.auth.uid
+        && !isPrimaryBootstrapAdmin(existing().uid);
+    }
+
+    // UID-keyed staff profiles: written atomically on initial admin bootstrap or by admins creating/updating staff.
+    match /staff_profiles/{userId} {
+      allow get: if isValidId(userId) && isSignedInUser() && (userId == request.auth.uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId)
+        && isSignedInUser()
+        && isValidStaffProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isInitialAdminBootstrap()
+            && userId == request.auth.uid
+            && incoming().email == callerEmail()
+            && incoming().role == 'admin'
+          )
+        );
+      allow update: if isValidId(userId)
+        && isAdmin()
+        && isValidStaffProfile(incoming(), userId)
+        && incoming().createdAt == existing().createdAt
+        && incoming().uid == existing().uid
+        && incoming().email == existing().email
+        && incoming().updatedAt == request.time
+        && (!isPrimaryBootstrapAdmin(userId) || incoming().role == 'admin')
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'role', 'updatedAt']);
+      allow delete: if isValidId(userId)
+        && isAdmin()
+        && userId != request.auth.uid
+        && !isPrimaryBootstrapAdmin(userId);
+    }
+
+    // Students collection: staff can read/create/rename; only admin can delete.
+    match /students/{studentId} {
+      allow get: if isValidId(studentId) && isStaff();
+      allow list: if isStaff();
+      allow create: if isValidId(studentId)
+        && isStaff()
+        && isValidStudent(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && incoming().createdByUid == request.auth.uid;
+      allow update: if isValidId(studentId)
+        && isStaff()
+        && isValidStudent(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['full_name', 'normalized_name', 'updatedAt']);
+      allow delete: if isValidId(studentId) && isAdmin();
+    }
+
+    // Attendance collection: deterministic ID (${attended_on}_${student_id}), immutable once recorded.
+    match /attendance/{attendanceId} {
+      allow get: if isValidId(attendanceId) && isStaff();
+      allow list: if isSignedInUser() && (
+        isAdmin()
+        || (isTeacher() && existing().recorded_by_uid == request.auth.uid)
+      );
+      allow create: if isValidId(attendanceId)
+        && isStaff()
+        && isValidAttendance(incoming())
+        && incoming().createdAt == request.time
+        && attendanceId == (incoming().attended_on + '_' + incoming().student_id)
+        && exists(/databases/$(database)/documents/students/$(incoming().student_id));
+      allow update: if false;
+      allow delete: if isValidId(attendanceId) && isAdmin();
+    }
+
+    // Global settings (/app_settings/global) and one-time bootstrap marker (/app_settings/bootstrap)
+    match /app_settings/{settingId} {
+      allow get: if isValidId(settingId) && settingId in ['global', 'bootstrap'];
+      allow list: if false;
+      allow create: if isValidId(settingId) && (
+        (
+          settingId == 'global'
+          && isAdmin()
+          && isValidAppSettings(incoming())
+          && incoming().updatedAt == request.time
+        )
+        || (
+          settingId == 'bootstrap'
+          && !exists(/databases/$(database)/documents/app_settings/bootstrap)
+          && isSignedInUser()
+          && isValidBootstrapConfig(incoming())
+          && incoming().createdAt == request.time
+        )
+      );
+      allow update: if isValidId(settingId)
+        && settingId == 'global'
+        && isAdmin()
+        && isValidAppSettings(incoming())
+        && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Public leaderboard summary (/public_results/latest)
+    match /public_results/{docId} {
+      allow get: if isValidId(docId)
+        && docId == 'latest'
+        && ((resource != null && existing().results_public == true) || isStaff());
+      allow list: if false;
+      allow create, update: if isValidId(docId)
+        && docId == 'latest'
+        && isStaff()
+        && isValidPublicResults(incoming())
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            exists(/databases/$(database)/documents/app_settings/global)
+            && incoming().results_public == get(/databases/$(database)/documents/app_settings/global).data.results_public
+          )
+        );
+      allow delete: if false;
+    }
+
+    // Admin AI assistant chat history
+    match /assistant_chats/{userId} {
+      allow get: if isValidId(userId) && isAdmin() && userId == request.auth.uid;
+      allow list: if false;
+      allow create, update: if isValidId(userId)
+        && isAdmin()
+        && userId == request.auth.uid
+        && isValidAssistantChat(incoming(), userId)
+        && incoming().updatedAt == request.time;
+      allow delete: if isValidId(userId) && isAdmin() && userId == request.auth.uid;
+    }
+  }
+}

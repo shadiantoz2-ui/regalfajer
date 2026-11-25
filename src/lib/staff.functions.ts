@@ -193,7 +193,7 @@ export const recordStaffCheckin = createServerFn({ method: "POST" })
   .inputValidator((d) =>
     z
       .object({
-        studentId: z.string().uuid(),
+        studentId: z.string().trim().min(1).max(120),
         studentName: z.string().trim().min(1).max(120),
         attendedOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       })
@@ -303,7 +303,7 @@ export const createTeacher = createServerFn({ method: "POST" })
 
 export const updateTeacherPassword = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d) => z.object({ id: z.string().uuid(), password: z.string().min(6).max(72) }).parse(d))
+  .inputValidator((d) => z.object({ id: z.string().trim().min(1).max(120), password: z.string().min(6).max(72) }).parse(d))
   .handler(async ({ data, context }) => {
     await assertAdmin(context.supabase, context.userId);
     if (hasLiveSupabaseWithoutAdminKey()) throw new Error(INVALID_KEY_MSG);
@@ -323,7 +323,7 @@ export const updateTeacherPassword = createServerFn({ method: "POST" })
 
 export const deleteTeacher = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d) => z.object({ id: z.string().uuid() }).parse(d))
+  .inputValidator((d) => z.object({ id: z.string().trim().min(1).max(120) }).parse(d))
   .handler(async ({ data, context }) => {
     await assertAdmin(context.supabase, context.userId);
     if (hasLiveSupabaseWithoutAdminKey()) throw new Error(INVALID_KEY_MSG);

@@ -1,68 +1,84 @@
-import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
+import { createFileRoute, Outlet, redirect, useNavigate, type ErrorComponentProps } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { supabase } from "@/integrations/supabase/client";
-import { LOGIN_DOMAIN } from "@/lib/login";
+import { ApiError, setSessionBearerToken } from "@/lib/api-client";
+import { fetchAuthState } from "@/lib/data";
+import type { StaffRole } from "@/lib/types";
 
-export type StaffRole = "admin" | "teacher";
+export type { StaffRole };
 
 export const Route = createFileRoute("/_authenticated")({
   ssr: false,
   beforeLoad: async ({ context }) => {
     return context.queryClient.ensureQueryData({
       queryKey: ["staff-session"],
-      staleTime: 5 * 60_000,
+      staleTime: 60_000,
       queryFn: async () => {
-        const { data: sessionData } = await supabase.auth.getSession();
-        let user = sessionData.session?.user ?? null;
-        if (!user) {
-          const { data } = await supabase.auth.getUser();
-          user = data.user;
-        }
-        if (!user) throw redirect({ to: "/auth" });
-        const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", user.id);
-        const list = (roles ?? []).map((r) => r.role);
-        const role: StaffRole | null = list.includes("admin") ? "admin" : list.includes("teacher") ? "teacher" : null;
-        if (!role) {
-          await supabase.auth.signOut();
+        const state = await fetchAuthState();
+        if (!state.user) {
           throw redirect({ to: "/auth" });
         }
-        const email = (user.email ?? "").trim().toLowerCase();
-        const rawName = String(user.user_metadata?.["full_name"] ?? "").trim();
-        const fallbackName =
-          email === "mohamad@gmail.com" ? "محمد حواصلي" : (user.email ?? "").replace(`@${LOGIN_DOMAIN}`, "");
-        const userName = rawName || fallbackName;
-        return { role, userName };
+        return {
+          uid: state.user.id,
+          username: state.user.username,
+          role: state.user.role,
+          userName: state.user.name,
+          isPrimaryAdmin: state.user.isPrimaryAdmin,
+        };
       },
     });
   },
+  errorComponent: StaffAuthErrorBoundary,
   component: StaffLayout,
 });
 
-/** Live updates: any device recording attendance refreshes every other open screen. */
+function StaffAuthErrorBoundary({ error, reset }: ErrorComponentProps) {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const isAuthError = error instanceof ApiError && error.status === 401;
+
+  useEffect(() => {
+    if (!isAuthError) return;
+    setSessionBearerToken(null);
+    qc.removeQueries({ queryKey: ["staff-session"] });
+    void navigate({ to: "/auth", replace: true });
+  }, [isAuthError, navigate, qc]);
+
+  if (isAuthError) {
+    return null;
+  }
+
+  return (
+    <div className="flex min-h-dvh items-center justify-center p-6 text-center">
+      <div className="max-w-md rounded-3xl p-6 surface">
+        <p className="font-display text-xl text-foreground">تعذّر تحميل الصفحة</p>
+        <p className="mt-2 text-sm text-muted-foreground">
+          {error instanceof Error ? error.message : "حدث خطأ غير متوقع، حاول مرة أخرى"}
+        </p>
+        <button
+          type="button"
+          onClick={() => reset()}
+          className="mt-4 cursor-pointer rounded-xl bg-gradient-gold px-5 py-2 text-sm font-semibold text-primary-foreground"
+        >
+          إعادة المحاولة
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function StaffLayout() {
   const qc = useQueryClient();
+
   useEffect(() => {
-    const channel = supabase
-      .channel(`staff-live-${Math.random().toString(36).slice(2)}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "attendance" }, (payload) => {
-        const row = (payload.new && "attended_on" in payload.new ? payload.new : payload.old) as { attended_on?: string };
-        if (row?.attended_on) void qc.invalidateQueries({ queryKey: ["attendance", row.attended_on] });
-        else void qc.invalidateQueries({ queryKey: ["attendance"] });
-      })
-      .on("postgres_changes", { event: "*", schema: "public", table: "students" }, () => {
-        void qc.invalidateQueries({ queryKey: ["students"] });
-      })
-      .on("postgres_changes", { event: "*", schema: "public", table: "app_settings" }, () => {
-        void qc.invalidateQueries({ queryKey: ["settings"] });
-      })
-      .subscribe();
-    const onFocus = () => void qc.invalidateQueries({ queryKey: ["attendance"] });
-    window.addEventListener("focus", onFocus);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      void supabase.removeChannel(channel);
+    const onFocus = () => {
+      void qc.invalidateQueries({ queryKey: ["attendance"] });
+      void qc.invalidateQueries({ queryKey: ["students"] });
+      void qc.invalidateQueries({ queryKey: ["my-day-recordings"] });
     };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, [qc]);
+
   return <Outlet />;
 }

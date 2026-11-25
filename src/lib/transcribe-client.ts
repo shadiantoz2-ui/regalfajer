@@ -1,5 +1,5 @@
 import { createParser } from "eventsource-parser";
-import { supabase } from "@/integrations/supabase/client";
+import { getSessionBearerToken } from "@/lib/api-client";
 import { collapseRepeatedPhrases, restoreArabicHamzaAndMadda } from "@/lib/arabic";
 
 let configuredCache: boolean | null = null;
@@ -12,7 +12,7 @@ export function resetTranscriptionConfigCache() {
 export async function isServerTranscriptionConfigured(): Promise<boolean> {
   if (configuredCache !== null) return configuredCache;
   if (!configuredInFlight) {
-    configuredInFlight = fetch("/api/transcribe")
+    configuredInFlight = fetch("/api/transcribe", { credentials: "include" })
       .then(async (res) => {
         if (!res.ok) return false;
         const data = (await res.json()) as { configured?: boolean };
@@ -28,30 +28,11 @@ export async function isServerTranscriptionConfigured(): Promise<boolean> {
   return configuredInFlight;
 }
 
-async function getValidAccessToken(): Promise<string | undefined> {
-  const { data } = await supabase.auth.getSession();
-  const session = data.session;
-  if (!session) return undefined;
-
-  const expiresAtMs = (session.expires_at ?? 0) * 1000;
-  if (expiresAtMs > 0 && expiresAtMs - Date.now() < 60_000) {
-    try {
-      const { data: refreshed } = await supabase.auth.refreshSession();
-      if (refreshed.session?.access_token) {
-        return refreshed.session.access_token;
-      }
-    } catch {
-      /* fall back to current token */
-    }
-  }
-  return session.access_token;
-}
-
 /** Upload a recorded clip and return the cleaned Arabic name with hamzas & maddas. */
 export async function transcribeAudio(file: File): Promise<string> {
   const form = new FormData();
   form.append("file", file, file.name);
-  const token = await getValidAccessToken();
+  const bearer = getSessionBearerToken();
 
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 25_000);
@@ -61,7 +42,11 @@ export async function transcribeAudio(file: File): Promise<string> {
     res = await fetch("/api/transcribe", {
       method: "POST",
       body: form,
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: "include",
+      headers: {
+        "X-Requested-With": "rijal-client",
+        ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+      },
       signal: controller.signal,
     });
   } catch (err) {

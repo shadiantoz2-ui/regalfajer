@@ -1,15 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { useServerFn } from "@tanstack/react-start";
 import { Suspense, useEffect, useState } from "react";
 import { Download, Loader2, Sunrise } from "lucide-react";
 import { toast } from "sonner";
 import { AppShell } from "@/components/AppShell";
 import { VoiceNamePicker } from "@/components/VoiceNamePicker";
 import { Button } from "@/components/ui/button";
-import { addStudent, dayAttendanceQuery, recordAttendance, studentsQuery } from "@/lib/data";
+import { addStudent, dayAttendanceQuery, myDayRecordingsQuery, recordAttendance, studentsQuery } from "@/lib/data";
 import { formatDateLong, localDateKey } from "@/lib/arabic";
-import { getMyDayRecordings, recordStaffCheckin } from "@/lib/staff.functions";
 
 export const Route = createFileRoute("/_authenticated/checkin")({
   head: () => ({
@@ -45,7 +43,6 @@ function CheckIn() {
   const { data: students } = useSuspenseQuery(studentsQuery());
   const today = useToday();
   const qc = useQueryClient();
-  const logCheckin = useServerFn(recordStaffCheckin);
 
   const showWelcome = role === "teacher" || (role === "admin" && Boolean(userName));
 
@@ -54,7 +51,7 @@ function CheckIn() {
       {showWelcome && (
         <div className="mb-5 rounded-3xl border border-primary/30 bg-primary/10 px-5 py-3.5 text-center surface">
           <p className="font-display text-xl text-gradient-gold md:text-2xl">
-            {userName ? `أهلا وسهلا بالأستاذ ${userName}` : "أهلا وسهلا بالأستاذ"}
+            {userName ? `أهلاً وسهلاً بالأستاذ ${userName}` : "أهلاً وسهلاً بالأستاذ"}
           </p>
         </div>
       )}
@@ -69,12 +66,7 @@ function CheckIn() {
           const date = localDateKey();
           const res = await recordAttendance(qc, s, date);
           if (res === "recorded") {
-            try {
-              await logCheckin({ data: { studentId: s.id, studentName: s.full_name, attendedOn: date } });
-              void qc.invalidateQueries({ queryKey: ["my-day-recordings", date] });
-            } catch {
-              /* attendance already persisted */
-            }
+            void qc.invalidateQueries({ queryKey: ["my-day-recordings", date] });
           }
           return res;
         }}
@@ -99,12 +91,7 @@ function CheckIn() {
 }
 
 function TeacherTodayList({ date }: { date: string }) {
-  const fetchMine = useServerFn(getMyDayRecordings);
-  const { data = [], isLoading } = useQuery({
-    queryKey: ["my-day-recordings", date],
-    queryFn: () => fetchMine({ data: { date } }),
-    staleTime: 15_000,
-  });
+  const { data = [], isLoading } = useQuery(myDayRecordingsQuery(date));
   const [downloading, setDownloading] = useState(false);
 
   const downloadMine = async () => {

@@ -1,199 +1,289 @@
-/** Direct reads/writes through the signed-in browser client: one hop, protected by row-level rules. */
 import { queryOptions, type QueryClient } from "@tanstack/react-query";
-import { supabase } from "@/integrations/supabase/client";
-import { cleanDisplayName, normalizeName } from "./arabic";
-import type { AttendanceRow, Student } from "./types";
+import { apiJson, setSessionBearerToken } from "./api-client";
+import type {
+  AttendanceRow,
+  StaffAccountView,
+  StaffRecordingItem,
+  StaffRole,
+  StaffSessionUser,
+  Student,
+} from "./types";
 
-const UNIQUE_VIOLATION = "23505";
+export type DayRow = { id: string; student_id: string; full_name: string; created_at: string };
+export type RenameResult = { status: "renamed" | "invalid" } | { status: "duplicate"; existing: string };
 
-export type DayRow = AttendanceRow & { full_name: string };
+export type AuthStateResponse = {
+  needsSetup: boolean;
+  user: StaffSessionUser | null;
+  token?: string | null;
+};
 
-async function fetchStudents(): Promise<Student[]> {
-  const all: Student[] = [];
-  for (let from = 0; ; from += 1000) {
-    const { data, error } = await supabase
-      .from("students")
-      .select("id, full_name, created_at")
-      .order("full_name")
-      .range(from, from + 999);
-    if (error) throw error;
-    all.push(...(data ?? []));
-    if (!data || data.length < 1000) break;
-  }
-  return all;
+export async function fetchAuthState(): Promise<AuthStateResponse> {
+  const res = await apiJson<AuthStateResponse>("/api/auth");
+  setSessionBearerToken(res.user ? (res.token ?? null) : null);
+  return res;
 }
 
-async function fetchDay(date: string): Promise<DayRow[]> {
-  const { data, error } = await supabase
-    .from("attendance")
-    .select("id, student_id, attended_on, created_at, students(full_name)")
-    .eq("attended_on", date)
-    .order("created_at", { ascending: false });
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
-    id: r.id,
-    student_id: r.student_id,
-    attended_on: r.attended_on,
-    created_at: r.created_at,
-    full_name: (r.students as { full_name: string } | null)?.full_name ?? "",
-  }));
+export async function setupPrimaryAdminAccount(input: {
+  name: string;
+  username: string;
+  password: string;
+}): Promise<StaffSessionUser> {
+  const res = await apiJson<{ ok: true; user: StaffSessionUser; token?: string }>("/api/auth", {
+    method: "POST",
+    body: JSON.stringify({ action: "setup_primary_admin", ...input }),
+  });
+  setSessionBearerToken(res.token ?? null);
+  return res.user;
+}
+
+export async function loginWithPassword(input: {
+  username: string;
+  password: string;
+}): Promise<StaffSessionUser> {
+  const res = await apiJson<{ ok: true; user: StaffSessionUser; token?: string }>("/api/auth", {
+    method: "POST",
+    body: JSON.stringify({ action: "login", ...input }),
+  });
+  setSessionBearerToken(res.token ?? null);
+  return res.user;
+}
+
+export async function logoutSession(): Promise<void> {
+  try {
+    await apiJson<{ ok: true }>("/api/auth", {
+      method: "POST",
+      body: JSON.stringify({ action: "logout" }),
+    });
+  } finally {
+    setSessionBearerToken(null);
+  }
+}
+
+export const staffAccountsQuery = () =>
+  queryOptions({
+    queryKey: ["staff-accounts"],
+    queryFn: async (): Promise<StaffAccountView[]> => {
+      const res = await apiJson<{ accounts: StaffAccountView[] }>("/api/staff");
+      return res.accounts;
+    },
+  });
+
+export const myDayRecordingsQuery = (date: string) =>
+  queryOptions({
+    queryKey: ["my-day-recordings", date],
+    queryFn: async (): Promise<StaffRecordingItem[]> => {
+      const res = await apiJson<{ rows: StaffRecordingItem[] }>(
+        `/api/staff?mode=my-recordings&date=${encodeURIComponent(date)}`,
+      );
+      return res.rows;
+    },
+    staleTime: 15_000,
+  });
+
+export const teacherDayRecordingsQuery = (staffId: string, date: string) =>
+  queryOptions({
+    queryKey: ["teacher-day-recordings", staffId, date],
+    queryFn: async (): Promise<StaffRecordingItem[]> => {
+      const res = await apiJson<{ rows: StaffRecordingItem[] }>(
+        `/api/staff?mode=recordings&staffId=${encodeURIComponent(staffId)}&date=${encodeURIComponent(date)}`,
+      );
+      return res.rows;
+    },
+  });
+
+export async function createStaffAccountApi(input: {
+  name: string;
+  username: string;
+  password: string;
+  role: StaffRole;
+}): Promise<StaffAccountView> {
+  const res = await apiJson<{ ok: true; account: StaffAccountView }>("/api/staff", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return res.account;
+}
+
+export async function updateStaffAccountApi(
+  id: string,
+  patch: { name?: string; role?: StaffRole; password?: string },
+): Promise<StaffAccountView> {
+  const res = await apiJson<{ ok: true; account: StaffAccountView }>("/api/staff", {
+    method: "PATCH",
+    body: JSON.stringify({ id, ...patch }),
+  });
+  return res.account;
+}
+
+export async function deleteStaffAccountApi(id: string): Promise<void> {
+  await apiJson<{ ok: true }>("/api/staff", {
+    method: "DELETE",
+    body: JSON.stringify({ id }),
+  });
 }
 
 export const studentsQuery = () =>
-  queryOptions({ queryKey: ["students"], queryFn: fetchStudents, staleTime: 60_000 });
+  queryOptions({
+    queryKey: ["students"],
+    queryFn: async (): Promise<Student[]> => {
+      const res = await apiJson<{ students: Student[] }>("/api/students");
+      return res.students;
+    },
+    staleTime: 60_000,
+  });
 
 export const dayAttendanceQuery = (date: string) =>
-  queryOptions({ queryKey: ["attendance", date], queryFn: () => fetchDay(date), staleTime: 30_000 });
+  queryOptions({
+    queryKey: ["attendance", date],
+    queryFn: async (): Promise<DayRow[]> => {
+      const res = await apiJson<{ rows: DayRow[] }>(`/api/attendance?date=${encodeURIComponent(date)}`);
+      return res.rows;
+    },
+    staleTime: 30_000,
+  });
 
 export const settingsQuery = () =>
   queryOptions({
     queryKey: ["settings"],
-    queryFn: async () => {
-      const { data, error } = await supabase.from("app_settings").select("results_public").eq("id", 1).maybeSingle();
-      if (error) throw error;
-      return { results_public: data?.results_public ?? false };
-    },
+    queryFn: () => apiJson<{ results_public: boolean }>("/api/settings"),
   });
 
 export const publicResultsQuery = () =>
   queryOptions({
     queryKey: ["public-results"],
-    queryFn: async () => {
-      const [{ data: settings }, { data, error }] = await Promise.all([
-        supabase.from("app_settings").select("results_public").eq("id", 1).maybeSingle(),
-        supabase.rpc("public_results"),
-      ]);
-      if (error) throw error;
-      return { open: settings?.results_public ?? false, rows: (data ?? []) as { full_name: string; days: number }[] };
-    },
+    queryFn: () =>
+      apiJson<{ open: boolean; rows: { full_name: string; days: number }[] }>("/api/settings?public=1"),
     refetchInterval: 30_000,
   });
 
 export async function setResultsPublic(value: boolean) {
-  const { error } = await supabase
-    .from("app_settings")
-    .update({ results_public: value, updated_at: new Date().toISOString() })
-    .eq("id", 1);
-  if (error) throw error;
+  await apiJson<{ ok: true; results_public: boolean }>("/api/settings", {
+    method: "PUT",
+    body: JSON.stringify({ results_public: value }),
+  });
 }
 
-export async function addStudent(rawName: string) {
-  const full_name = cleanDisplayName(rawName);
-  const normalized_name = normalizeName(full_name);
-  if (!normalized_name) return { status: "invalid" as const };
-  const { data, error } = await supabase
-    .from("students")
-    .insert({ full_name, normalized_name })
-    .select("id, full_name, created_at")
-    .single();
-  if (error) {
-    if (error.code === UNIQUE_VIOLATION) {
-      const { data: existing } = await supabase
-        .from("students")
-        .select("id, full_name, created_at")
-        .eq("normalized_name", normalized_name)
-        .maybeSingle();
-      return { status: "duplicate" as const, student: (existing as Student | null) ?? null };
-    }
-    throw error;
-  }
-  return { status: "created" as const, student: data as Student };
+export async function addStudent(
+  rawName: string,
+): Promise<
+  | { status: "created"; student: Student }
+  | { status: "duplicate"; existing: string; student: Student | null }
+  | { status: "invalid" }
+> {
+  return apiJson("/api/students", {
+    method: "POST",
+    body: JSON.stringify({ fullName: rawName }),
+  });
 }
 
 export const studentAttendanceQuery = (studentId: string) =>
   queryOptions({
     queryKey: ["student-attendance", studentId],
     queryFn: async (): Promise<AttendanceRow[]> => {
-      const { data, error } = await supabase
-        .from("attendance")
-        .select("id, student_id, attended_on, created_at")
-        .eq("student_id", studentId)
-        .order("attended_on", { ascending: false });
-      if (error) throw error;
-      return data ?? [];
+      const res = await apiJson<{ rows: AttendanceRow[] }>(
+        `/api/attendance?studentId=${encodeURIComponent(studentId)}`,
+      );
+      return res.rows;
     },
   });
 
-export type RenameResult = { status: "renamed" | "invalid" } | { status: "duplicate"; existing: string };
-
-/** Staff (admin or teacher) can rename a student. Same duplicate rule as adding. */
 export async function renameStudent(id: string, rawName: string): Promise<RenameResult> {
-  const full_name = cleanDisplayName(rawName);
-  const normalized_name = normalizeName(full_name);
-  if (!normalized_name || full_name.split(" ").length < 2) return { status: "invalid" };
-  const { error } = await supabase.from("students").update({ full_name, normalized_name }).eq("id", id);
-  if (error) {
-    if (error.code === UNIQUE_VIOLATION) {
-      const { data: existing } = await supabase
-        .from("students")
-        .select("full_name")
-        .eq("normalized_name", normalized_name)
-        .maybeSingle();
-      return { status: "duplicate", existing: existing?.full_name ?? full_name };
-    }
-    throw error;
-  }
-  return { status: "renamed" };
+  return apiJson<RenameResult>("/api/students", {
+    method: "PATCH",
+    body: JSON.stringify({ id, fullName: rawName }),
+  });
 }
 
 export async function deleteStudent(id: string) {
-  const { error } = await supabase.from("students").delete().eq("id", id);
-  if (error) throw error;
+  await apiJson<{ ok: true }>("/api/students", {
+    method: "DELETE",
+    body: JSON.stringify({ id }),
+  });
 }
 
-/** Records attendance and updates the day's list immediately (before the live update arrives). */
-export async function recordAttendance(qc: QueryClient, student: Student, date: string) {
-  const { data, error } = await supabase
-    .from("attendance")
-    .insert({ student_id: student.id, attended_on: date })
-    .select("id, student_id, attended_on, created_at")
-    .single();
-  if (error) {
-    if (error.code === UNIQUE_VIOLATION) return "duplicate" as const;
-    throw error;
-  }
-  qc.setQueryData<DayRow[]>(["attendance", date], (old) =>
-    old && !old.some((r) => r.id === data.id) ? [{ ...data, full_name: student.full_name }, ...old] : old,
-  );
-  return "recorded" as const;
+export async function recordAttendance(
+  qc: QueryClient,
+  student: Student,
+  date: string,
+): Promise<"recorded" | "duplicate"> {
+  const res = await apiJson<{ status: "recorded" | "duplicate" }>("/api/attendance", {
+    method: "POST",
+    body: JSON.stringify({ mode: "single", studentId: student.id, date }),
+  });
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: ["attendance", date] }),
+    qc.invalidateQueries({ queryKey: ["my-day-recordings", date] }),
+    qc.invalidateQueries({ queryKey: ["student-attendance", student.id] }),
+    qc.invalidateQueries({ queryKey: ["public-results"] }),
+  ]);
+  return res.status;
 }
 
-/** Records many students for one date; students already recorded that day are skipped, never doubled. */
-export async function recordAttendanceBulk(qc: QueryClient, studentIds: string[], date: string) {
-  const ids = [...new Set(studentIds)];
-  if (!ids.length) return { recorded: 0, skipped: 0 };
-  const { data, error } = await supabase
-    .from("attendance")
-    .upsert(
-      ids.map((student_id) => ({ student_id, attended_on: date })),
-      { onConflict: "student_id,attended_on", ignoreDuplicates: true },
-    )
-    .select("id");
-  if (error) throw error;
-  const recorded = data?.length ?? 0;
-  await qc.invalidateQueries({ queryKey: ["attendance", date] });
-  return { recorded, skipped: ids.length - recorded };
+export async function recordAttendanceBulk(
+  qc: QueryClient,
+  studentIds: string[],
+  date: string,
+): Promise<{ recorded: number; skipped: number }> {
+  const res = await apiJson<{ recorded: number; skipped: number }>("/api/attendance", {
+    method: "POST",
+    body: JSON.stringify({ mode: "bulk", studentIds, date }),
+  });
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: ["attendance", date] }),
+    qc.invalidateQueries({ queryKey: ["my-day-recordings", date] }),
+    qc.invalidateQueries({ queryKey: ["student-attendance"] }),
+    qc.invalidateQueries({ queryKey: ["public-results"] }),
+  ]);
+  return res;
 }
 
 export async function deleteAttendance(id: string) {
-  const { error } = await supabase.from("attendance").delete().eq("id", id);
-  if (error) throw error;
+  await apiJson<{ ok: true }>("/api/attendance", {
+    method: "DELETE",
+    body: JSON.stringify({ id }),
+  });
 }
 
 export async function fetchAllAttendance(from?: string, to?: string): Promise<AttendanceRow[]> {
-  const all: AttendanceRow[] = [];
-  for (let offset = 0; ; offset += 1000) {
-    let q = supabase
-      .from("attendance")
-      .select("id, student_id, attended_on, created_at")
-      .order("attended_on")
-      .range(offset, offset + 999);
-    if (from) q = q.gte("attended_on", from);
-    if (to) q = q.lte("attended_on", to);
-    const { data, error } = await q;
-    if (error) throw error;
-    all.push(...(data ?? []));
-    if (!data || data.length < 1000) break;
-  }
-  return all;
+  const params = new URLSearchParams();
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  const qs = params.toString();
+  const res = await apiJson<{ rows: AttendanceRow[] }>(`/api/attendance${qs ? `?${qs}` : ""}`);
+  return res.rows;
+}
+
+export async function importHistoricalAttendance(
+  qc: QueryClient,
+): Promise<{ studentsCreated: number; attendanceCreated: number }> {
+  const res = await apiJson<{ studentsCreated: number; attendanceCreated: number }>("/api/students", {
+    method: "POST",
+    body: JSON.stringify({ action: "import_seed" }),
+  });
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: ["students"] }),
+    qc.invalidateQueries({ queryKey: ["attendance"] }),
+    qc.invalidateQueries({ queryKey: ["student-attendance"] }),
+    qc.invalidateQueries({ queryKey: ["public-results"] }),
+  ]);
+  return res;
+}
+
+export async function recordStudentPastDates(
+  qc: QueryClient,
+  student: Student,
+  dates: readonly string[],
+  maxDate: string,
+): Promise<{ recorded: number; skipped: number }> {
+  const res = await apiJson<{ recorded: number; skipped: number }>("/api/attendance", {
+    method: "POST",
+    body: JSON.stringify({ mode: "past_dates", studentId: student.id, dates, maxDate }),
+  });
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: ["attendance"] }),
+    qc.invalidateQueries({ queryKey: ["student-attendance", student.id] }),
+    qc.invalidateQueries({ queryKey: ["public-results"] }),
+  ]);
+  return res;
 }

@@ -10,7 +10,7 @@ import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Tool, ToolContent, ToolHeader, ToolInput, ToolOutput } from "@/components/ai-elements/tool";
 import { AlGhufranLogo } from "@/components/AlGhufranLogo";
 import { Button } from "@/components/ui/button";
-import { supabase } from "@/integrations/supabase/client";
+import { getSessionBearerToken } from "@/lib/api-client";
 import { localDateKey } from "@/lib/arabic";
 import { clearAssistantChat, readableChatError } from "@/lib/assistant-chat";
 
@@ -35,16 +35,19 @@ export default function AssistantChatWindow({ initial }: { initial: UIMessage[] 
     () =>
       new DefaultChatTransport({
         api: "/api/assistant",
-        headers: async (): Promise<Record<string, string>> => {
-          const { data } = await supabase.auth.getSession();
-          const token = data.session?.access_token;
-          return token ? { Authorization: `Bearer ${token}` } : {};
+        credentials: "include",
+        headers: () => {
+          const bearer = getSessionBearerToken();
+          return {
+            "X-Requested-With": "rijal-client",
+            ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+          };
         },
         body: () => ({ today: localDateKey() }),
       }),
     [],
   );
-  const { messages, sendMessage, status, stop, setMessages } = useChat({
+  const { messages, sendMessage, status, stop, setMessages, error, clearError } = useChat({
     id: "rijal-assistant",
     messages: initial,
     transport,
@@ -64,6 +67,7 @@ export default function AssistantChatWindow({ initial }: { initial: UIMessage[] 
   const send = (text: string) => {
     const t = text.trim();
     if (!t || busy) return;
+    clearError();
     void sendMessage({ text: t });
   };
 
@@ -79,6 +83,7 @@ export default function AssistantChatWindow({ initial }: { initial: UIMessage[] 
   const newConversation = async () => {
     if (busy) await stop();
     try {
+      clearError();
       await clearAssistantChat();
       setMessages([]);
       inputRef.current?.focus();
@@ -163,6 +168,17 @@ export default function AssistantChatWindow({ initial }: { initial: UIMessage[] 
                 <Shimmer>يبحث في بيانات الحضور...</Shimmer>
               </MessageContent>
             </Message>
+          )}
+          {error && (
+            <div
+              role="alert"
+              className="flex items-center justify-between gap-3 rounded-2xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+            >
+              <span>{readableChatError(error)}</span>
+              <Button type="button" variant="ghost" size="sm" onClick={() => clearError()} className="shrink-0 text-destructive hover:text-destructive">
+                إغلاق
+              </Button>
+            </div>
           )}
         </ConversationContent>
         <ConversationScrollButton />

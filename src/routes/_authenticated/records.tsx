@@ -1,7 +1,7 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { Suspense, useEffect, useState } from "react";
-import { CalendarDays, Download, FileSpreadsheet, History, Loader2, Trash2 } from "lucide-react";
+import { CalendarDays, Download, FileSpreadsheet, History, Loader2, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { AppShell } from "@/components/AppShell";
 import { VoiceNamePicker } from "@/components/VoiceNamePicker";
@@ -13,6 +13,7 @@ import {
   dayAttendanceQuery,
   deleteAttendance,
   fetchAllAttendance,
+  importHistoricalAttendance,
   recordAttendance,
   studentsQuery,
 } from "@/lib/data";
@@ -67,6 +68,7 @@ function RecordsPage() {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
 
   useEffect(() => {
     const t = localDateKey();
@@ -100,6 +102,25 @@ function RecordsPage() {
     }
   };
 
+  const runHistoricalImport = async () => {
+    setImporting(true);
+    try {
+      const res = await importHistoricalAttendance(qc);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem("rijal_seed_nov2026_v1", "done");
+      }
+      if (res.studentsCreated === 0 && res.attendanceCreated === 0) {
+        toast.info("جميع بيانات الكشف المحفوظ (72 طالباً) مستوردة مسبقاً");
+      } else {
+        toast.success(`تم استيراد ${res.studentsCreated} طالباً و${res.attendanceCreated} سجل حضور`);
+      }
+    } catch {
+      toast.error("تعذّر استيراد بيانات الكشف المحفوظ");
+    } finally {
+      setImporting(false);
+    }
+  };
+
   return (
     <AppShell compact role={role} userName={userName}>
       <section className="rounded-[2rem] p-6 surface">
@@ -114,6 +135,19 @@ function RecordsPage() {
         <Button variant="gold" size="xl" className="mt-4 w-full" onClick={download} disabled={exporting}>
           {exporting ? <Loader2 className="size-5 animate-spin" /> : <Download className="size-5" />}
           تحميل بيانات الحضور
+        </Button>
+      </section>
+
+      <section className="mt-6 rounded-[2rem] p-6 surface">
+        <h2 className="font-display flex items-center gap-2 text-2xl">
+          <Upload className="size-6 text-primary" /> استيراد كشف الحضور المحفوظ (21–25 نوفمبر — 72 طالباً)
+        </h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          يدمج أسماء الطلاب الـ 72 وسجلات حضورهم للأيام من 21 إلى 25 نوفمبر دون تكرار الأسماء أو السجلات الموجودة.
+        </p>
+        <Button variant="glass" size="xl" className="mt-4 w-full" onClick={runHistoricalImport} disabled={importing}>
+          {importing ? <Loader2 className="size-5 animate-spin" /> : <Upload className="size-5" />}
+          استيراد بيانات الطلاب والحضور
         </Button>
       </section>
 
