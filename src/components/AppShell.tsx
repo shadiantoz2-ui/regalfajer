@@ -1,8 +1,8 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { CalendarClock, LogIn, LogOut, MessageCircleQuestion, Mic, ShieldCheck, Trophy, Users } from "lucide-react";
-import logo from "@/assets/rijal-alfajr-logo.webp.asset.json";
+import { CalendarClock, LogIn, LogOut, MessageCircleQuestion, Mic, ShieldCheck, Trophy, UserPlus, Users } from "lucide-react";
+import { AlGhufranLogo } from "@/components/AlGhufranLogo";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
 
@@ -27,7 +27,11 @@ export function AppShell({
   role?: Role;
   userName?: string;
 }) {
-  const nav = role ? ALL_NAV.filter((n) => (n.roles as readonly string[]).includes(role)) : [];
+  const nav = role
+    ? ALL_NAV.filter((n) => (n.roles as readonly string[]).includes(role)).map((item) =>
+        item.to === "/students" && role === "teacher" ? { ...item, label: "إضافة طالب", icon: UserPlus } : item,
+      )
+    : [];
   const navigate = useNavigate();
   const qc = useQueryClient();
 
@@ -74,13 +78,9 @@ export function AppShell({
 
       <header className="relative mx-auto flex max-w-3xl flex-col items-center px-5 pt-2 text-center">
         <Link to="/" className="group flex flex-col items-center">
-          <img
-            src={logo.url}
-            alt="شعار مسجد الغفران"
-            className={cn(
-              "drop-shadow-[0_10px_30px_color-mix(in_oklab,var(--primary)_35%,transparent)] transition-transform duration-500 group-hover:scale-105",
-              compact ? "h-20 w-20" : "h-32 w-32 md:h-40 md:w-40",
-            )}
+          <AlGhufranLogo
+            compact={compact}
+            className="transition-transform duration-500 group-hover:scale-105"
           />
           <h1
             className={cn(

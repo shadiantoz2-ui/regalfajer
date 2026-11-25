@@ -1,12 +1,14 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { Loader2, LogIn } from "lucide-react";
+import { toast } from "sonner";
 import { AppShell } from "@/components/AppShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { supabase } from "@/integrations/supabase/client";
-import { loginToEmail } from "@/lib/login";
+import { LOGIN_DOMAIN, loginToEmail } from "@/lib/login";
 
 export const Route = createFileRoute("/auth")({
   head: () => ({
@@ -25,6 +27,7 @@ export const Route = createFileRoute("/auth")({
 
 function AuthPage() {
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const [login, setLogin] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -34,12 +37,30 @@ function AuthPage() {
     e.preventDefault();
     setBusy(true);
     setError("");
-    const { error: err } = await supabase.auth.signInWithPassword({ email: loginToEmail(login), password });
-    setBusy(false);
+    const { data, error: err } = await supabase.auth.signInWithPassword({ email: loginToEmail(login), password });
     if (err) {
-      setError("اسم الدخول أو كلمة المرور غير صحيحة");
+      setBusy(false);
+      const isKeyErr = /api key|forbidden|secret/i.test(err.message);
+      setError(
+        isKeyErr
+          ? "مفتاح الاتصال بقاعدة البيانات غير صالح — تحقّق من VITE_SUPABASE_PUBLISHABLE_KEY"
+          : "اسم الدخول أو كلمة المرور غير صحيحة",
+      );
       return;
     }
+    qc.removeQueries({ queryKey: ["staff-session"] });
+    if (data.user) {
+      const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", data.user.id);
+      const list = (roles ?? []).map((r) => r.role);
+      if (list.includes("admin") || list.includes("teacher")) {
+        const email = (data.user.email ?? "").trim().toLowerCase();
+        const rawName = String(data.user.user_metadata?.["full_name"] ?? "").trim();
+        const displayName =
+          rawName || (email === "mohamad@gmail.com" ? "محمد حواصلي" : (data.user.email ?? "").replace(`@${LOGIN_DOMAIN}`, ""));
+        toast.success(displayName ? `أهلا وسهلا بالأستاذ ${displayName}` : "أهلا وسهلا بالأستاذ");
+      }
+    }
+    setBusy(false);
     navigate({ to: "/checkin", replace: true });
   };
 

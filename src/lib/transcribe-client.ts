@@ -1,21 +1,85 @@
 import { createParser } from "eventsource-parser";
 import { supabase } from "@/integrations/supabase/client";
+import { collapseRepeatedPhrases, restoreArabicHamzaAndMadda } from "@/lib/arabic";
 
-/** Upload a recorded clip and read the streamed transcript to the end. */
+let configuredCache: boolean | null = null;
+let configuredInFlight: Promise<boolean> | null = null;
+
+export function resetTranscriptionConfigCache() {
+  configuredCache = null;
+}
+
+export async function isServerTranscriptionConfigured(): Promise<boolean> {
+  if (configuredCache !== null) return configuredCache;
+  if (!configuredInFlight) {
+    configuredInFlight = fetch("/api/transcribe")
+      .then(async (res) => {
+        if (!res.ok) return false;
+        const data = (await res.json()) as { configured?: boolean };
+        const ok = Boolean(data.configured);
+        configuredCache = ok;
+        return ok;
+      })
+      .catch(() => false)
+      .finally(() => {
+        configuredInFlight = null;
+      });
+  }
+  return configuredInFlight;
+}
+
+async function getValidAccessToken(): Promise<string | undefined> {
+  const { data } = await supabase.auth.getSession();
+  const session = data.session;
+  if (!session) return undefined;
+
+  const expiresAtMs = (session.expires_at ?? 0) * 1000;
+  if (expiresAtMs > 0 && expiresAtMs - Date.now() < 60_000) {
+    try {
+      const { data: refreshed } = await supabase.auth.refreshSession();
+      if (refreshed.session?.access_token) {
+        return refreshed.session.access_token;
+      }
+    } catch {
+      /* fall back to current token */
+    }
+  }
+  return session.access_token;
+}
+
+/** Upload a recorded clip and return the cleaned Arabic name with hamzas & maddas. */
 export async function transcribeAudio(file: File): Promise<string> {
   const form = new FormData();
   form.append("file", file, file.name);
-  const { data: session } = await supabase.auth.getSession();
-  const token = session.session?.access_token;
-  const res = await fetch("/api/transcribe", {
-    method: "POST",
-    body: form,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const token = await getValidAccessToken();
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 25_000);
+
+  let res: Response;
+  try {
+    res = await fetch("/api/transcribe", {
+      method: "POST",
+      body: form,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("استغرق التعرف على الصوت وقتاً طويلاً، حاول مرة أخرى");
+    }
+    throw new Error("تعذّر الاتصال بخدمة التعرف على الصوت، تحقّق من الشبكة");
+  } finally {
+    window.clearTimeout(timeout);
+  }
+
   if (!res.ok || !res.body) {
+    if (res.status === 402 || res.status === 403 || res.status === 503) {
+      configuredCache = false;
+    }
     let message = "تعذّر التعرف على الصوت، حاول مرة أخرى";
     try {
-      const body = await res.json();
+      const body = (await res.json()) as { error?: { message?: string } };
       if (res.status === 401) message = "انتهت الجلسة، سجّل الدخول من جديد";
       else if (res.status === 402) message = "انتهى رصيد خدمة التعرف على الصوت";
       else if (res.status === 429) message = "طلبات كثيرة، انتظر لحظة ثم أعد المحاولة";
@@ -25,6 +89,14 @@ export async function transcribeAudio(file: File): Promise<string> {
     }
     throw new Error(message);
   }
+
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const payload = (await res.json()) as { text?: unknown; error?: { message?: string } };
+    if (payload.error?.message) throw new Error(String(payload.error.message));
+    return restoreArabicHamzaAndMadda(collapseRepeatedPhrases(String(payload.text ?? "")));
+  }
+
   let text = "";
   let final: string | null = null;
   let streamError: string | null = null;
@@ -41,6 +113,7 @@ export async function transcribeAudio(file: File): Promise<string> {
       }
     },
   });
+
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   for (;;) {
     const { value, done } = await reader.read();
@@ -48,5 +121,5 @@ export async function transcribeAudio(file: File): Promise<string> {
     parser.feed(value);
   }
   if (streamError) throw new Error("تعذّر التعرف على الصوت، حاول مرة أخرى");
-  return (final ?? text).trim();
+  return restoreArabicHamzaAndMadda(collapseRepeatedPhrases(final ?? text));
 }

@@ -100,9 +100,23 @@ export async function addStudent(rawName: string) {
   return { status: "created" as const, student: data as Student };
 }
 
+export const studentAttendanceQuery = (studentId: string) =>
+  queryOptions({
+    queryKey: ["student-attendance", studentId],
+    queryFn: async (): Promise<AttendanceRow[]> => {
+      const { data, error } = await supabase
+        .from("attendance")
+        .select("id, student_id, attended_on, created_at")
+        .eq("student_id", studentId)
+        .order("attended_on", { ascending: false });
+      if (error) throw error;
+      return data ?? [];
+    },
+  });
+
 export type RenameResult = { status: "renamed" | "invalid" } | { status: "duplicate"; existing: string };
 
-/** Admin only (enforced by row-level rules). Same duplicate rule as adding. */
+/** Staff (admin or teacher) can rename a student. Same duplicate rule as adding. */
 export async function renameStudent(id: string, rawName: string): Promise<RenameResult> {
   const full_name = cleanDisplayName(rawName);
   const normalized_name = normalizeName(full_name);

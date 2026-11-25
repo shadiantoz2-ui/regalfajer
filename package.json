@@ -4,10 +4,11 @@
   "sideEffects": false,
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
-    "build": "vite build",
+    "dev": "vite dev --host 0.0.0.0 --port 3000",
+    "build": "NODE_ENV=production vite build",
     "build:dev": "vite build --mode development",
-    "preview": "vite preview",
+    "start": "NODE_ENV=production node .output/server/index.mjs",
+    "preview": "vite preview --host 0.0.0.0 --port 3000",
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "vitest run",
@@ -20,6 +21,7 @@
   "dependencies": {
     "@ai-sdk/openai": "^4.0.122",
     "@ai-sdk/react": "^4.0.183",
+    "@google/genai": "^3.6.1",
     "@hookform/resolvers": "^5.2.2",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-alert-dialog": "^1.1.15",

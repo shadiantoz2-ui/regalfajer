@@ -9,10 +9,43 @@
 // You can pass additional config via defineConfig({ vite: { ... }, etc... }) if needed.
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
+// Never allow a secret key pasted into VITE_SUPABASE_PUBLISHABLE_KEY to reach the browser bundle or break auth.
+if (
+  process.env["VITE_SUPABASE_PUBLISHABLE_KEY"]?.startsWith("sb_secret_") &&
+  process.env["SUPABASE_PUBLISHABLE_KEY"]?.startsWith("sb_publishable_")
+) {
+  process.env["VITE_SUPABASE_PUBLISHABLE_KEY"] = process.env["SUPABASE_PUBLISHABLE_KEY"];
+}
+
 export default defineConfig({
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
     server: { entry: "server" },
+  },
+  nitro: {
+    preset: "node-server",
+  },
+  vite: {
+    server: {
+      host: "0.0.0.0",
+      port: 3000,
+      allowedHosts: true,
+    },
+    optimizeDeps: {
+      include: [
+        "@tanstack/react-router",
+        "@tanstack/react-query",
+        "@supabase/supabase-js",
+        "lucide-react",
+        "sonner",
+        "clsx",
+        "tailwind-merge",
+        "class-variance-authority",
+        "@radix-ui/react-dialog",
+        "@radix-ui/react-alert-dialog",
+        "@radix-ui/react-switch",
+      ],
+    },
   },
 });

@@ -1,0 +1,10 @@
+{
+  "name": "رجال الفجر",
+  "description": "نظام تسجيل حضور طلاب صلاة الفجر بالصوت وإدارة الطلاب والنتائج.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

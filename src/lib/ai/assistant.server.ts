@@ -4,6 +4,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { convertToModelMessages, isStepCount, streamText, tool, validateUIMessages, type UIMessage } from "ai";
 import { z } from "zod/v4";
 import type { Database } from "@/integrations/supabase/types";
+import { createMockSupabaseClient, parseMockJwtUserId } from "@/integrations/supabase/mock";
 import { nameSimilarity } from "@/lib/arabic";
 import {
   createLovableAiGatewayRunIdFetch,
@@ -30,7 +31,13 @@ async function adminClient(request: Request): Promise<{ db: Db; userId: string }
   if (token.split(".").length !== 3) return null;
   const url = process.env["SUPABASE_URL"];
   const key = process.env["SUPABASE_PUBLISHABLE_KEY"];
-  if (!url || !key) return null;
+  if (!url || !key) {
+    const uid = parseMockJwtUserId(token);
+    if (!uid) return null;
+    const db = createMockSupabaseClient(uid);
+    const { data: isAdmin } = await db.rpc("has_role", { _user_id: uid, _role: "admin" });
+    return isAdmin === true ? { db, userId: uid } : null;
+  }
   const db = createClient<Database>(url, key, {
     auth: { persistSession: false, autoRefreshToken: false, storage: undefined },
     global: {
