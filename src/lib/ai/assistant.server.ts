@@ -36,21 +36,26 @@ function json(status: number, message: string) {
   return Response.json({ error: { message } }, { status });
 }
 
-function adminAuth(request: Request): { userId: string } | null {
-  const session = resolveSession(request);
-  if (!session || session.role !== "admin") return null;
-  return { userId: session.id };
+async function adminAuth(request: Request): Promise<{ userId: string } | null> {
+  try {
+    const session = await resolveSession(request);
+    if (!session || session.role !== "admin") return null;
+    return { userId: session.id };
+  } catch {
+    return null;
+  }
 }
 
 function dataLoader() {
   let cache: Promise<AssistantData> | null = null;
   const load = async (): Promise<AssistantData> => {
-    const students: Student[] = listStudents().map((s) => ({
+    const [rawStudents, rawAttendance] = await Promise.all([listStudents(), listAllAttendance()]);
+    const students: Student[] = rawStudents.map((s) => ({
       id: s.id,
       full_name: s.full_name,
       created_at: s.created_at,
     }));
-    const attendance: Att[] = listAllAttendance().map((a) => ({
+    const attendance: Att[] = rawAttendance.map((a) => ({
       student_id: a.student_id,
       attended_on: a.attended_on,
     }));
@@ -473,7 +478,7 @@ async function handleWithGemini(
     onFinish: async ({ messages: all }) => {
       if (all.length === 0 || all.at(-1)?.role !== "assistant") return;
       try {
-        upsertAssistantChatMessages(auth.userId, all);
+        await upsertAssistantChatMessages(auth.userId, all);
       } catch (error) {
         console.error("assistant: failed to save conversation", error);
       }
@@ -488,7 +493,7 @@ async function handleWithGemini(
 }
 
 export async function handleAssistant(request: Request): Promise<Response> {
-  const auth = adminAuth(request);
+  const auth = await adminAuth(request);
   if (!auth) return json(403, "المساعد متاح للمدير فقط");
   if (!verifySameOriginMutation(request)) {
     return json(403, "طلب غير مصرّح به");
@@ -553,7 +558,7 @@ export async function handleAssistant(request: Request): Promise<Response> {
       sendReasoning: true,
       onFinish: async ({ messages: all }) => {
         try {
-          upsertAssistantChatMessages(auth.userId, all);
+          await upsertAssistantChatMessages(auth.userId, all);
         } catch (error) {
           console.error("assistant: failed to save conversation", error);
         }

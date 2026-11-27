@@ -10,8 +10,8 @@ import {
 import { resolveSession, verifySameOriginMutation } from "@/lib/server/auth.server";
 
 /** Only signed-in staff may use voice recognition. */
-function isStaffRequest(request: Request): boolean {
-  return resolveSession(request) !== null;
+async function isStaffRequest(request: Request): Promise<boolean> {
+  return (await resolveSession(request)) !== null;
 }
 
 const MAX_BYTES = 10 * 1024 * 1024;
@@ -110,7 +110,7 @@ export const Route = createFileRoute("/api/transcribe")({
         if (!verifySameOriginMutation(request)) {
           return Response.json({ error: { message: "طلب غير مصرّح به" } }, { status: 403 });
         }
-        if (!isStaffRequest(request)) {
+        if (!(await isStaffRequest(request))) {
           return Response.json({ error: { message: "انتهت الجلسة، سجّل الدخول أولاً" } }, { status: 401 });
         }
 

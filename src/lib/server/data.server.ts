@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { cleanDisplayName, normalizeName } from "@/lib/arabic";
+import { and, asc, desc, eq, gte, inArray, lte, type SQL } from "drizzle-orm";
 import {
   computePublicLeaderboard,
   normalizePastAttendanceDates,
   STAFF_LIMITS,
   validateStudentDisplayName,
 } from "@/lib/firebase/domain";
-import { HISTORICAL_NOV2026_SEED } from "@/lib/seed-nov2026";
 import type { AttendanceRow, StaffRecordingItem, StaffSessionUser, Student } from "@/lib/types";
-import { getDb } from "./db.server";
+import { appSettings, assistantChats, attendance, students } from "../../db/schema.ts";
+import { ensureInitialDataSeeded, getDb } from "./db.server";
 
 export type DayRow = {
   id: string;
@@ -17,408 +17,534 @@ export type DayRow = {
   created_at: string;
 };
 
-export function listStudents(): Student[] {
-  const db = getDb();
-  const rows = db
-    .prepare(`SELECT id, full_name, created_at FROM students`)
-    .all() as Array<{ id: string; full_name: string; created_at: string }>;
-  return rows.sort((a, b) => a.full_name.localeCompare(b.full_name, "ar"));
+export async function listStudents(): Promise<Student[]> {
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    const rows = await db
+      .select({
+        id: students.id,
+        full_name: students.fullName,
+        created_at: students.createdAt,
+      })
+      .from(students);
+    return rows.sort((a, b) => a.full_name.localeCompare(b.full_name, "ar"));
+  } catch (error) {
+    console.error("Failed to list students:", error);
+    throw new Error("تعذّر تحميل قائمة الطلاب", { cause: error });
+  }
 }
 
-export function addStudent(
+export async function addStudent(
   rawName: string,
   actorId: string,
-):
+): Promise<
   | { status: "created"; student: Student }
   | { status: "duplicate"; existing: string; student: Student }
-  | { status: "invalid" } {
+  | { status: "invalid" }
+> {
+  await ensureInitialDataSeeded();
   const { valid, full_name, normalized_name } = validateStudentDisplayName(rawName);
   if (!valid) return { status: "invalid" };
 
-  const db = getDb();
-  const existing = db
-    .prepare(`SELECT id, full_name, created_at FROM students WHERE normalized_name = ?`)
-    .get(normalized_name) as Student | undefined;
-  if (existing) {
-    return { status: "duplicate", existing: existing.full_name, student: existing };
+  try {
+    const db = getDb();
+    const existingRows = await db
+      .select({
+        id: students.id,
+        full_name: students.fullName,
+        created_at: students.createdAt,
+      })
+      .from(students)
+      .where(eq(students.normalizedName, normalized_name))
+      .limit(1);
+
+    const existing = existingRows[0];
+    if (existing) {
+      return { status: "duplicate", existing: existing.full_name, student: existing };
+    }
+
+    const id = randomUUID();
+    const nowIso = new Date().toISOString();
+    await db.insert(students).values({
+      id,
+      fullName: full_name,
+      normalizedName: normalized_name,
+      createdById: actorId,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    return { status: "created", student: { id, full_name, created_at: nowIso } };
+  } catch (error) {
+    console.error("Failed to add student:", error);
+    throw new Error("تعذّر إضافة الطالب", { cause: error });
   }
-
-  const id = randomUUID();
-  const nowIso = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO students (id, full_name, normalized_name, created_by_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, full_name, normalized_name, actorId, nowIso, nowIso);
-
-  return { status: "created", student: { id, full_name, created_at: nowIso } };
 }
 
-export function renameStudent(
+export async function renameStudent(
   id: string,
   rawName: string,
-): { status: "renamed" } | { status: "duplicate"; existing: string } | { status: "invalid" } {
+): Promise<{ status: "renamed" } | { status: "duplicate"; existing: string } | { status: "invalid" }> {
+  await ensureInitialDataSeeded();
   const { valid, full_name, normalized_name } = validateStudentDisplayName(rawName);
   if (!valid || !id) return { status: "invalid" };
 
-  const db = getDb();
-  const existing = db
-    .prepare(`SELECT id, full_name FROM students WHERE normalized_name = ?`)
-    .get(normalized_name) as { id: string; full_name: string } | undefined;
-  if (existing && existing.id !== id) {
-    return { status: "duplicate", existing: existing.full_name };
-  }
-
-  const target = db.prepare(`SELECT id FROM students WHERE id = ?`).get(id) as { id: string } | undefined;
-  if (!target) return { status: "invalid" };
-
-  const nowIso = new Date().toISOString();
-  db.exec("BEGIN IMMEDIATE");
   try {
-    db.prepare(`UPDATE students SET full_name = ?, normalized_name = ?, updated_at = ? WHERE id = ?`).run(
-      full_name,
-      normalized_name,
-      nowIso,
-      id,
-    );
-    db.prepare(`UPDATE attendance SET student_name = ? WHERE student_id = ?`).run(full_name, id);
-    db.exec("COMMIT");
-    return { status: "renamed" };
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
-}
+    const db = getDb();
+    const existingRows = await db
+      .select({ id: students.id, full_name: students.fullName })
+      .from(students)
+      .where(eq(students.normalizedName, normalized_name))
+      .limit(1);
 
-export function deleteStudent(id: string): boolean {
-  const db = getDb();
-  const res = db.prepare(`DELETE FROM students WHERE id = ?`).run(id);
-  return Number(res.changes) > 0;
-}
-
-export function importHistoricalAttendanceSeed(): { studentsCreated: number; attendanceCreated: number } {
-  const db = getDb();
-  let studentsCreated = 0;
-  let attendanceCreated = 0;
-
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const findStudent = db.prepare(`SELECT id, full_name FROM students WHERE normalized_name = ?`);
-    const insertStudent = db.prepare(
-      `INSERT INTO students (id, full_name, normalized_name, created_by_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    );
-    const insertAttendance = db.prepare(
-      `INSERT OR IGNORE INTO attendance (
-        id, student_id, student_name, attended_on, recorded_by_id, recorded_by_name, recorded_by_username, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-
-    const nowIso = new Date().toISOString();
-    for (const item of HISTORICAL_NOV2026_SEED) {
-      const fullName = cleanDisplayName(item.fullName);
-      const normalized = normalizeName(fullName);
-      if (!fullName || !normalized) continue;
-
-      let studentRow = findStudent.get(normalized) as { id: string; full_name: string } | undefined;
-      if (!studentRow) {
-        const id = randomUUID();
-        insertStudent.run(id, fullName, normalized, "system_seed", nowIso, nowIso);
-        studentRow = { id, full_name: fullName };
-        studentsCreated += 1;
-      }
-
-      for (const attendedOn of item.dates) {
-        const attId = `${attendedOn}_${studentRow.id}`;
-        const changes = insertAttendance.run(
-          attId,
-          studentRow.id,
-          studentRow.full_name,
-          attendedOn,
-          "system_seed",
-          "سجل الإدارة",
-          "system",
-          `${attendedOn}T04:30:00.000Z`,
-        ).changes;
-        if (Number(changes) > 0) attendanceCreated += 1;
-      }
+    const existing = existingRows[0];
+    if (existing && existing.id !== id) {
+      return { status: "duplicate", existing: existing.full_name };
     }
 
-    db.prepare(`INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)`).run("nov2026_seeded", "1");
-    db.exec("COMMIT");
-    return { studentsCreated, attendanceCreated };
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
+    const target = await db
+      .select({ id: students.id })
+      .from(students)
+      .where(eq(students.id, id))
+      .limit(1);
+    if (target.length === 0) return { status: "invalid" };
+
+    const nowIso = new Date().toISOString();
+    await db.transaction(async (tx) => {
+      await tx
+        .update(students)
+        .set({
+          fullName: full_name,
+          normalizedName: normalized_name,
+          updatedAt: nowIso,
+        })
+        .where(eq(students.id, id));
+
+      await tx
+        .update(attendance)
+        .set({ studentName: full_name })
+        .where(eq(attendance.studentId, id));
+    });
+
+    return { status: "renamed" };
+  } catch (error) {
+    console.error("Failed to rename student:", error);
+    throw new Error("تعذّر تعديل اسم الطالب", { cause: error });
   }
 }
 
-export function listDayAttendance(date: string): DayRow[] {
+export async function deleteStudent(id: string): Promise<boolean> {
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    const deleted = await db
+      .delete(students)
+      .where(eq(students.id, id))
+      .returning({ id: students.id });
+    return deleted.length > 0;
+  } catch (error) {
+    console.error("Failed to delete student:", error);
+    throw new Error("تعذّر حذف الطالب", { cause: error });
+  }
+}
+
+export async function listDayAttendance(date: string): Promise<DayRow[]> {
   if (!STAFF_LIMITS.DATE_PATTERN.test(date)) return [];
-  const db = getDb();
-  return db
-    .prepare(
-      `SELECT id, student_id, student_name AS full_name, created_at
-       FROM attendance
-       WHERE attended_on = ?
-       ORDER BY created_at DESC`,
-    )
-    .all(date) as DayRow[];
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    return await db
+      .select({
+        id: attendance.id,
+        student_id: attendance.studentId,
+        full_name: attendance.studentName,
+        created_at: attendance.createdAt,
+      })
+      .from(attendance)
+      .where(eq(attendance.attendedOn, date))
+      .orderBy(desc(attendance.createdAt));
+  } catch (error) {
+    console.error("Failed to list day attendance:", error);
+    throw new Error("تعذّر تحميل حضور اليوم", { cause: error });
+  }
 }
 
-export function listStudentAttendance(studentId: string): AttendanceRow[] {
+export async function listStudentAttendance(studentId: string): Promise<AttendanceRow[]> {
   if (!studentId) return [];
-  const db = getDb();
-  return db
-    .prepare(
-      `SELECT id, student_id, attended_on, created_at
-       FROM attendance
-       WHERE student_id = ?
-       ORDER BY attended_on DESC`,
-    )
-    .all(studentId) as AttendanceRow[];
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    return await db
+      .select({
+        id: attendance.id,
+        student_id: attendance.studentId,
+        attended_on: attendance.attendedOn,
+        created_at: attendance.createdAt,
+      })
+      .from(attendance)
+      .where(eq(attendance.studentId, studentId))
+      .orderBy(desc(attendance.attendedOn));
+  } catch (error) {
+    console.error("Failed to list student attendance:", error);
+    throw new Error("تعذّر تحميل سجل حضور الطالب", { cause: error });
+  }
 }
 
-export function listAllAttendance(from?: string, to?: string): AttendanceRow[] {
-  const db = getDb();
-  const clauses: string[] = [];
-  const params: string[] = [];
+export async function listAllAttendance(from?: string, to?: string): Promise<AttendanceRow[]> {
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    const filters: SQL[] = [];
+    if (from && STAFF_LIMITS.DATE_PATTERN.test(from)) {
+      filters.push(gte(attendance.attendedOn, from));
+    }
+    if (to && STAFF_LIMITS.DATE_PATTERN.test(to)) {
+      filters.push(lte(attendance.attendedOn, to));
+    }
 
-  if (from && STAFF_LIMITS.DATE_PATTERN.test(from)) {
-    clauses.push("attended_on >= ?");
-    params.push(from);
-  }
-  if (to && STAFF_LIMITS.DATE_PATTERN.test(to)) {
-    clauses.push("attended_on <= ?");
-    params.push(to);
-  }
+    const baseQuery = db
+      .select({
+        id: attendance.id,
+        student_id: attendance.studentId,
+        attended_on: attendance.attendedOn,
+        created_at: attendance.createdAt,
+      })
+      .from(attendance);
 
-  const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  return db
-    .prepare(
-      `SELECT id, student_id, attended_on, created_at
-       FROM attendance
-       ${whereSql}
-       ORDER BY attended_on ASC, created_at ASC`,
-    )
-    .all(...params) as AttendanceRow[];
+    if (filters.length > 0) {
+      return await baseQuery.where(and(...filters)).orderBy(asc(attendance.attendedOn), asc(attendance.createdAt));
+    }
+    return await baseQuery.orderBy(asc(attendance.attendedOn), asc(attendance.createdAt));
+  } catch (error) {
+    console.error("Failed to list all attendance:", error);
+    throw new Error("تعذّر تحميل سجلات الحضور", { cause: error });
+  }
 }
 
-export function listStaffDayRecordings(staffId: string, date: string): StaffRecordingItem[] {
+export async function listStaffDayRecordings(staffId: string, date: string): Promise<StaffRecordingItem[]> {
   if (!staffId || !STAFF_LIMITS.DATE_PATTERN.test(date)) return [];
-  const db = getDb();
-  return db
-    .prepare(
-      `SELECT
-         id,
-         recorded_by_id AS teacherId,
-         recorded_by_username AS teacherUsername,
-         recorded_by_name AS teacherName,
-         student_id AS studentId,
-         student_name AS studentName,
-         attended_on AS attendedOn,
-         created_at AS recordedAt
-       FROM attendance
-       WHERE recorded_by_id = ? AND attended_on = ?
-       ORDER BY created_at DESC`,
-    )
-    .all(staffId, date) as StaffRecordingItem[];
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    return await db
+      .select({
+        id: attendance.id,
+        teacherId: attendance.recordedById,
+        teacherUsername: attendance.recordedByUsername,
+        teacherName: attendance.recordedByName,
+        studentId: attendance.studentId,
+        studentName: attendance.studentName,
+        attendedOn: attendance.attendedOn,
+        recordedAt: attendance.createdAt,
+      })
+      .from(attendance)
+      .where(and(eq(attendance.recordedById, staffId), eq(attendance.attendedOn, date)))
+      .orderBy(desc(attendance.createdAt));
+  } catch (error) {
+    console.error("Failed to list staff day recordings:", error);
+    throw new Error("تعذّر تحميل تسجيلات الحضور", { cause: error });
+  }
 }
 
-export function recordAttendance(
+export async function recordAttendance(
   studentId: string,
   attendedOn: string,
   actor: StaffSessionUser,
-): { status: "recorded" | "duplicate" | "not_found" } {
+): Promise<{ status: "recorded" | "duplicate" | "not_found" }> {
   if (!STAFF_LIMITS.DATE_PATTERN.test(attendedOn)) {
     throw new Error("تاريخ غير صالح");
   }
-  const db = getDb();
-  const student = db
-    .prepare(`SELECT id, full_name FROM students WHERE id = ?`)
-    .get(studentId) as { id: string; full_name: string } | undefined;
-  if (!student) return { status: "not_found" };
+  await ensureInitialDataSeeded();
 
-  const attId = `${attendedOn}_${student.id}`;
-  const nowIso = new Date().toISOString();
-  const res = db
-    .prepare(
-      `INSERT OR IGNORE INTO attendance (
-        id, student_id, student_name, attended_on, recorded_by_id, recorded_by_name, recorded_by_username, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(attId, student.id, student.full_name, attendedOn, actor.id, actor.name, actor.username, nowIso);
+  try {
+    const db = getDb();
+    const studentRows = await db
+      .select({ id: students.id, fullName: students.fullName })
+      .from(students)
+      .where(eq(students.id, studentId))
+      .limit(1);
 
-  return { status: Number(res.changes) > 0 ? "recorded" : "duplicate" };
+    const student = studentRows[0];
+    if (!student) return { status: "not_found" };
+
+    const attId = `${attendedOn}_${student.id}`;
+    const nowIso = new Date().toISOString();
+    const inserted = await db
+      .insert(attendance)
+      .values({
+        id: attId,
+        studentId: student.id,
+        studentName: student.fullName,
+        attendedOn,
+        recordedById: actor.id,
+        recordedByName: actor.name,
+        recordedByUsername: actor.username,
+        createdAt: nowIso,
+      })
+      .onConflictDoNothing()
+      .returning({ id: attendance.id });
+
+    return { status: inserted.length > 0 ? "recorded" : "duplicate" };
+  } catch (error) {
+    console.error("Failed to record attendance:", error);
+    throw new Error("تعذّر تسجيل الحضور", { cause: error });
+  }
 }
 
-export function recordAttendanceBulk(
+export async function recordAttendanceBulk(
   studentIds: readonly string[],
   attendedOn: string,
   actor: StaffSessionUser,
-): { recorded: number; skipped: number } {
+): Promise<{ recorded: number; skipped: number }> {
   if (!STAFF_LIMITS.DATE_PATTERN.test(attendedOn)) {
     throw new Error("تاريخ غير صالح");
   }
   const uniqueIds = Array.from(new Set(studentIds.filter(Boolean)));
   if (!uniqueIds.length) return { recorded: 0, skipped: 0 };
 
-  const db = getDb();
-  let recorded = 0;
-  let skipped = 0;
-  const nowIso = new Date().toISOString();
+  await ensureInitialDataSeeded();
 
-  db.exec("BEGIN IMMEDIATE");
   try {
-    const findStudent = db.prepare(`SELECT id, full_name FROM students WHERE id = ?`);
-    const insertAttendance = db.prepare(
-      `INSERT OR IGNORE INTO attendance (
-        id, student_id, student_name, attended_on, recorded_by_id, recorded_by_name, recorded_by_username, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
+    const db = getDb();
+    const foundStudents = await db
+      .select({ id: students.id, fullName: students.fullName })
+      .from(students)
+      .where(inArray(students.id, uniqueIds));
 
+    const studentMap = new Map(foundStudents.map((s) => [s.id, s.fullName]));
+    const nowIso = new Date().toISOString();
+
+    const toInsert: Array<typeof attendance.$inferInsert> = [];
+    let missingCount = 0;
     for (const studentId of uniqueIds) {
-      const student = findStudent.get(studentId) as { id: string; full_name: string } | undefined;
-      if (!student) {
-        skipped += 1;
+      const fullName = studentMap.get(studentId);
+      if (!fullName) {
+        missingCount += 1;
         continue;
       }
-      const changes = insertAttendance.run(
-        `${attendedOn}_${student.id}`,
-        student.id,
-        student.full_name,
+      toInsert.push({
+        id: `${attendedOn}_${studentId}`,
+        studentId,
+        studentName: fullName,
         attendedOn,
-        actor.id,
-        actor.name,
-        actor.username,
-        nowIso,
-      ).changes;
-      if (Number(changes) > 0) recorded += 1;
-      else skipped += 1;
+        recordedById: actor.id,
+        recordedByName: actor.name,
+        recordedByUsername: actor.username,
+        createdAt: nowIso,
+      });
     }
 
-    db.exec("COMMIT");
+    if (toInsert.length === 0) {
+      return { recorded: 0, skipped: uniqueIds.length };
+    }
+
+    const inserted = await db
+      .insert(attendance)
+      .values(toInsert)
+      .onConflictDoNothing()
+      .returning({ id: attendance.id });
+
+    const recorded = inserted.length;
+    const skipped = missingCount + (toInsert.length - recorded);
     return { recorded, skipped };
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
+  } catch (error) {
+    console.error("Failed to record bulk attendance:", error);
+    throw new Error("تعذّر تسجيل الحضور الجماعي", { cause: error });
   }
 }
 
-export function recordStudentPastDates(
+export async function recordStudentPastDates(
   studentId: string,
   dates: readonly string[],
   maxDate: string,
   actor: StaffSessionUser,
-): { recorded: number; skipped: number } {
-  const db = getDb();
-  const student = db
-    .prepare(`SELECT id, full_name FROM students WHERE id = ?`)
-    .get(studentId) as { id: string; full_name: string } | undefined;
-  if (!student) {
-    throw new Error("الطالب غير موجود");
-  }
-
-  const existing = db
-    .prepare(`SELECT attended_on FROM attendance WHERE student_id = ?`)
-    .all(student.id) as Array<{ attended_on: string }>;
-  const existingSet = new Set(existing.map((r) => r.attended_on));
-
-  const { validDates, skippedCount } = normalizePastAttendanceDates(dates, maxDate, existingSet);
-  if (!validDates.length) return { recorded: 0, skipped: skippedCount };
-
-  const nowIso = new Date().toISOString();
-  let recorded = 0;
-
-  db.exec("BEGIN IMMEDIATE");
+): Promise<{ recorded: number; skipped: number }> {
+  await ensureInitialDataSeeded();
   try {
-    const insertAttendance = db.prepare(
-      `INSERT OR IGNORE INTO attendance (
-        id, student_id, student_name, attended_on, recorded_by_id, recorded_by_name, recorded_by_username, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (const attendedOn of validDates) {
-      const changes = insertAttendance.run(
-        `${attendedOn}_${student.id}`,
-        student.id,
-        student.full_name,
-        attendedOn,
-        actor.id,
-        actor.name,
-        actor.username,
-        nowIso,
-      ).changes;
-      if (Number(changes) > 0) recorded += 1;
+    const db = getDb();
+    const studentRows = await db
+      .select({ id: students.id, fullName: students.fullName })
+      .from(students)
+      .where(eq(students.id, studentId))
+      .limit(1);
+
+    const student = studentRows[0];
+    if (!student) {
+      throw new Error("الطالب غير موجود");
     }
-    db.exec("COMMIT");
-    return { recorded, skipped: skippedCount };
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
+
+    const existing = await db
+      .select({ attendedOn: attendance.attendedOn })
+      .from(attendance)
+      .where(eq(attendance.studentId, student.id));
+
+    const existingSet = new Set(existing.map((r) => r.attendedOn));
+    const { validDates, skippedCount } = normalizePastAttendanceDates(dates, maxDate, existingSet);
+    if (!validDates.length) return { recorded: 0, skipped: skippedCount };
+
+    const nowIso = new Date().toISOString();
+    const values: Array<typeof attendance.$inferInsert> = validDates.map((attendedOn) => ({
+      id: `${attendedOn}_${student.id}`,
+      studentId: student.id,
+      studentName: student.fullName,
+      attendedOn,
+      recordedById: actor.id,
+      recordedByName: actor.name,
+      recordedByUsername: actor.username,
+      createdAt: nowIso,
+    }));
+
+    const inserted = await db
+      .insert(attendance)
+      .values(values)
+      .onConflictDoNothing()
+      .returning({ id: attendance.id });
+
+    return { recorded: inserted.length, skipped: skippedCount + (values.length - inserted.length) };
+  } catch (error) {
+    if (error instanceof Error && error.message === "الطالب غير موجود") {
+      throw error;
+    }
+    console.error("Failed to record student past dates:", error);
+    throw new Error("تعذّر تسجيل الأيام السابقة", { cause: error });
   }
 }
 
-export function deleteAttendance(id: string): boolean {
-  const db = getDb();
-  const res = db.prepare(`DELETE FROM attendance WHERE id = ?`).run(id);
-  return Number(res.changes) > 0;
+export async function deleteAttendance(id: string): Promise<boolean> {
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    const deleted = await db
+      .delete(attendance)
+      .where(eq(attendance.id, id))
+      .returning({ id: attendance.id });
+    return deleted.length > 0;
+  } catch (error) {
+    console.error("Failed to delete attendance:", error);
+    throw new Error("تعذّر إلغاء سجل الحضور", { cause: error });
+  }
 }
 
-export function getResultsPublic(): boolean {
-  const db = getDb();
-  const row = db
-    .prepare(`SELECT value FROM app_settings WHERE key = ?`)
-    .get("results_public") as { value?: string } | undefined;
-  return row?.value === "true";
+export async function getResultsPublic(): Promise<boolean> {
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    const rows = await db
+      .select({ value: appSettings.value })
+      .from(appSettings)
+      .where(eq(appSettings.key, "results_public"))
+      .limit(1);
+    return rows[0]?.value === "true";
+  } catch (error) {
+    console.error("Failed to read results_public setting:", error);
+    throw new Error("تعذّر قراءة إعدادات النتائج", { cause: error });
+  }
 }
 
-export function setResultsPublic(value: boolean, actorId: string): void {
-  const db = getDb();
-  db.prepare(
-    `INSERT OR REPLACE INTO app_settings (key, value, updated_at, updated_by_id) VALUES (?, ?, ?, ?)`,
-  ).run("results_public", value ? "true" : "false", new Date().toISOString(), actorId);
+export async function setResultsPublic(value: boolean, actorId: string): Promise<void> {
+  await ensureInitialDataSeeded();
+  try {
+    const db = getDb();
+    const nowIso = new Date().toISOString();
+    const serialized = value ? "true" : "false";
+    await db
+      .insert(appSettings)
+      .values({
+        key: "results_public",
+        value: serialized,
+        updatedAt: nowIso,
+        updatedById: actorId,
+      })
+      .onConflictDoUpdate({
+        target: appSettings.key,
+        set: {
+          value: serialized,
+          updatedAt: nowIso,
+          updatedById: actorId,
+        },
+      });
+  } catch (error) {
+    console.error("Failed to update results_public setting:", error);
+    throw new Error("تعذّر تحديث إعدادات النتائج", { cause: error });
+  }
 }
 
-export function getPublicLeaderboard(): { open: boolean; rows: { full_name: string; days: number }[] } {
-  const open = getResultsPublic();
+export async function getPublicLeaderboard(): Promise<{ open: boolean; rows: { full_name: string; days: number }[] }> {
+  const open = await getResultsPublic();
   if (!open) return { open: false, rows: [] };
 
-  const db = getDb();
-  const students = db
-    .prepare(`SELECT id, full_name FROM students`)
-    .all() as Array<{ id: string; full_name: string }>;
-  const attendance = db
-    .prepare(`SELECT student_id FROM attendance`)
-    .all() as Array<{ student_id: string }>;
-
-  return {
-    open: true,
-    rows: computePublicLeaderboard(students, attendance),
-  };
-}
-
-export function getAssistantChatMessages(userId: string): unknown[] {
-  const db = getDb();
-  const row = db
-    .prepare(`SELECT messages FROM assistant_chats WHERE user_id = ?`)
-    .get(userId) as { messages?: string } | undefined;
-  if (!row?.messages) return [];
   try {
-    const parsed = JSON.parse(row.messages) as unknown;
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+    const db = getDb();
+    const [studentRows, attendanceRows] = await Promise.all([
+      db.select({ id: students.id, full_name: students.fullName }).from(students),
+      db.select({ student_id: attendance.studentId }).from(attendance),
+    ]);
+
+    return {
+      open: true,
+      rows: computePublicLeaderboard(studentRows, attendanceRows),
+    };
+  } catch (error) {
+    console.error("Failed to compute public leaderboard:", error);
+    throw new Error("تعذّر تحميل لوحة النتائج", { cause: error });
   }
 }
 
-export function upsertAssistantChatMessages(userId: string, messages: unknown[]): void {
-  const db = getDb();
-  const trimmed = messages.slice(-100);
-  db.prepare(
-    `INSERT OR REPLACE INTO assistant_chats (user_id, messages, updated_at) VALUES (?, ?, ?)`,
-  ).run(userId, JSON.stringify(trimmed), new Date().toISOString());
+export async function getAssistantChatMessages(userId: string): Promise<unknown[]> {
+  try {
+    const db = getDb();
+    const rows = await db
+      .select({ messages: assistantChats.messages })
+      .from(assistantChats)
+      .where(eq(assistantChats.userId, userId))
+      .limit(1);
+
+    const raw = rows[0]?.messages;
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  } catch (error) {
+    console.error("Failed to fetch assistant chat messages:", error);
+    throw new Error("تعذّر تحميل سجل المساعد", { cause: error });
+  }
 }
 
-export function clearAssistantChatMessages(userId: string): void {
-  const db = getDb();
-  db.prepare(`DELETE FROM assistant_chats WHERE user_id = ?`).run(userId);
+export async function upsertAssistantChatMessages(userId: string, messages: unknown[]): Promise<void> {
+  try {
+    const db = getDb();
+    const nowIso = new Date().toISOString();
+    const serialized = JSON.stringify(messages);
+    await db
+      .insert(assistantChats)
+      .values({
+        userId,
+        messages: serialized,
+        updatedAt: nowIso,
+      })
+      .onConflictDoUpdate({
+        target: assistantChats.userId,
+        set: {
+          messages: serialized,
+          updatedAt: nowIso,
+        },
+      });
+  } catch (error) {
+    console.error("Failed to save assistant chat messages:", error);
+    throw new Error("تعذّر حفظ محادثة المساعد", { cause: error });
+  }
+}
+
+export async function clearAssistantChatMessages(userId: string): Promise<void> {
+  try {
+    const db = getDb();
+    await db.delete(assistantChats).where(eq(assistantChats.userId, userId));
+  } catch (error) {
+    console.error("Failed to clear assistant chat messages:", error);
+    throw new Error("تعذّر مسح محادثة المساعد", { cause: error });
+  }
 }

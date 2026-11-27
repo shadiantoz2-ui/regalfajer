@@ -1,34 +1,31 @@
 import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { asc, count, desc, eq } from "drizzle-orm";
 import { STAFF_LIMITS, validateStaffAccountInput } from "@/lib/firebase/domain";
 import type { StaffAccountView, StaffRole, StaffSessionUser } from "@/lib/types";
+import { attendance, staffAccounts } from "../../db/schema.ts";
 import { getDb, getOrCreateSessionSecret } from "./db.server";
 
 export const SESSION_COOKIE_NAME = "rijal_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14;
 const DUMMY_SALT = "0123456789abcdef0123456789abcdef";
 
-type StaffRow = {
+function toAccountView(row: {
   id: string;
   name: string;
   username: string;
-  password_hash: string;
-  password_salt: string;
-  role: StaffRole;
-  is_primary_admin: number;
-  created_by_id: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
-function toAccountView(row: Omit<StaffRow, "password_hash" | "password_salt" | "created_by_id">): StaffAccountView {
+  role: string;
+  isPrimaryAdmin: boolean;
+  createdAt: string;
+  updatedAt: string;
+}): StaffAccountView {
   return {
     id: row.id,
     name: row.name,
     username: row.username,
     role: row.role === "admin" ? "admin" : "teacher",
-    isPrimaryAdmin: row.is_primary_admin === 1,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    isPrimaryAdmin: row.isPrimaryAdmin,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 
@@ -54,17 +51,17 @@ export function verifyPassword(password: string, storedHashHex: string, saltHex:
   }
 }
 
-export function signSessionToken(userId: string): string {
+export function signSessionTokenWithSecret(userId: string, secret: string): string {
   const nowSec = Math.floor(Date.now() / 1000);
   const payload = Buffer.from(
     JSON.stringify({ sub: userId, iat: nowSec, exp: nowSec + SESSION_TTL_SECONDS }),
     "utf8",
   ).toString("base64url");
-  const sig = createHmac("sha256", getOrCreateSessionSecret()).update(payload).digest("base64url");
+  const sig = createHmac("sha256", secret).update(payload).digest("base64url");
   return `${payload}.${sig}`;
 }
 
-export function verifySessionToken(token: string): string | null {
+export function verifySessionTokenWithSecret(token: string, secret: string): string | null {
   const parts = token.split(".");
   if (parts.length !== 2) return null;
   const payload = parts[0] ?? "";
@@ -72,7 +69,7 @@ export function verifySessionToken(token: string): string | null {
   if (!payload || !sig) return null;
 
   try {
-    const expectedSig = createHmac("sha256", getOrCreateSessionSecret()).update(payload).digest("base64url");
+    const expectedSig = createHmac("sha256", secret).update(payload).digest("base64url");
     const sigBuf = Buffer.from(sig, "utf8");
     const expBuf = Buffer.from(expectedSig, "utf8");
     if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
@@ -90,6 +87,16 @@ export function verifySessionToken(token: string): string | null {
   } catch {
     return null;
   }
+}
+
+export async function signSessionToken(userId: string): Promise<string> {
+  const secret = await getOrCreateSessionSecret();
+  return signSessionTokenWithSecret(userId, secret);
+}
+
+export async function verifySessionToken(token: string): Promise<string | null> {
+  const secret = await getOrCreateSessionSecret();
+  return verifySessionTokenWithSecret(token, secret);
 }
 
 function parseCookieHeader(cookieHeader: string | null): Map<string, string> {
@@ -126,7 +133,11 @@ export function isHttpsRequest(request: Request): boolean {
   }
 }
 
-export function buildSessionCookieHeader(request: Request, token: string, maxAgeSeconds = SESSION_TTL_SECONDS): string {
+export function buildSessionCookieHeader(
+  request: Request,
+  token: string,
+  maxAgeSeconds = SESSION_TTL_SECONDS,
+): string {
   const encoded = encodeURIComponent(token);
   if (isHttpsRequest(request)) {
     return `${SESSION_COOKIE_NAME}=${encoded}; HttpOnly; Path=/; Max-Age=${maxAgeSeconds}; Secure; SameSite=None; Partitioned`;
@@ -179,45 +190,61 @@ export function verifySameOriginMutation(request: Request): boolean {
   return false;
 }
 
-export function resolveSession(request: Request): StaffSessionUser | null {
+export async function resolveSession(request: Request): Promise<StaffSessionUser | null> {
   const bearerToken = extractBearerSessionToken(request);
   const cookies = parseCookieHeader(request.headers.get("cookie"));
   const token = bearerToken ?? cookies.get(SESSION_COOKIE_NAME);
   if (!token) return null;
 
-  const userId = verifySessionToken(token);
+  const userId = await verifySessionToken(token);
   if (!userId) return null;
 
-  const db = getDb();
-  const row = db
-    .prepare(
-      `SELECT id, name, username, role, is_primary_admin FROM staff_accounts WHERE id = ?`,
-    )
-    .get(userId) as
-    | { id: string; name: string; username: string; role: StaffRole; is_primary_admin: number }
-    | undefined;
-  if (!row) return null;
+  try {
+    const db = getDb();
+    const rows = await db
+      .select({
+        id: staffAccounts.id,
+        name: staffAccounts.name,
+        username: staffAccounts.username,
+        role: staffAccounts.role,
+        isPrimaryAdmin: staffAccounts.isPrimaryAdmin,
+      })
+      .from(staffAccounts)
+      .where(eq(staffAccounts.id, userId))
+      .limit(1);
 
-  return {
-    id: row.id,
-    name: row.name,
-    username: row.username,
-    role: row.role === "admin" ? "admin" : "teacher",
-    isPrimaryAdmin: row.is_primary_admin === 1,
-  };
+    const row = rows[0];
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      name: row.name,
+      username: row.username,
+      role: row.role === "admin" ? "admin" : "teacher",
+      isPrimaryAdmin: row.isPrimaryAdmin,
+    };
+  } catch (error) {
+    console.error("Failed to resolve staff session:", error);
+    throw new Error("تعذّر التحقق من الجلسة في قاعدة البيانات", { cause: error });
+  }
 }
 
-export function hasAnyStaffAccount(): boolean {
-  const db = getDb();
-  const row = db.prepare(`SELECT COUNT(*) AS cnt FROM staff_accounts`).get() as { cnt: number };
-  return row.cnt > 0;
+export async function hasAnyStaffAccount(): Promise<boolean> {
+  try {
+    const db = getDb();
+    const rows = await db.select({ cnt: count() }).from(staffAccounts);
+    return Number(rows[0]?.cnt ?? 0) > 0;
+  } catch (error) {
+    console.error("Failed to check staff accounts existence:", error);
+    throw new Error("تعذّر التحقق من حسابات الإدارة", { cause: error });
+  }
 }
 
-export function setupPrimaryAdmin(input: {
+export async function setupPrimaryAdmin(input: {
   name: string;
   username: string;
   password: string;
-}): { ok: true; user: StaffSessionUser } | { ok: false; error: string; status: number } {
+}): Promise<{ ok: true; user: StaffSessionUser } | { ok: false; error: string; status: number }> {
   const validated = validateStaffAccountInput({
     name: input.name,
     username: input.username,
@@ -229,117 +256,131 @@ export function setupPrimaryAdmin(input: {
     return { ok: false, error: validated.error, status: 400 };
   }
 
-  const db = getDb();
-  db.exec("BEGIN IMMEDIATE");
   try {
-    const countRow = db.prepare(`SELECT COUNT(*) AS cnt FROM staff_accounts`).get() as { cnt: number };
-    if (countRow.cnt > 0) {
-      db.exec("ROLLBACK");
-      return {
-        ok: false,
-        error: "تم إعداد حساب المدير الأساسي مسبقاً، سجّل الدخول باسم المستخدم وكلمة المرور",
-        status: 409,
-      };
-    }
+    const db = getDb();
+    return await db.transaction(async (tx) => {
+      const existing = await tx.select({ cnt: count() }).from(staffAccounts);
+      if (Number(existing[0]?.cnt ?? 0) > 0) {
+        return {
+          ok: false,
+          error: "تم إعداد حساب المدير الأساسي مسبقاً، سجّل الدخول باسم المستخدم وكلمة المرور",
+          status: 409,
+        } as const;
+      }
 
-    const id = randomUUID();
-    const nowIso = new Date().toISOString();
-    const { hash, salt } = hashPassword(input.password);
-    const cleanUsername = normalizeUsername(input.username);
+      const id = randomUUID();
+      const nowIso = new Date().toISOString();
+      const { hash, salt } = hashPassword(input.password);
+      const cleanUsername = normalizeUsername(input.username);
 
-    db.prepare(
-      `INSERT INTO staff_accounts (
-        id, name, username, password_hash, password_salt, role, is_primary_admin, created_by_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 'admin', 1, ?, ?, ?)`,
-    ).run(id, validated.name, cleanUsername, hash, salt, id, nowIso, nowIso);
-
-    db.exec("COMMIT");
-    return {
-      ok: true,
-      user: {
+      await tx.insert(staffAccounts).values({
         id,
         name: validated.name,
         username: cleanUsername,
+        passwordHash: hash,
+        passwordSalt: salt,
         role: "admin",
         isPrimaryAdmin: true,
-      },
-    };
-  } catch (err) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      /* ignore rollback errors */
-    }
-    throw err;
+        createdById: id,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      return {
+        ok: true,
+        user: {
+          id,
+          name: validated.name,
+          username: cleanUsername,
+          role: "admin",
+          isPrimaryAdmin: true,
+        },
+      } as const;
+    });
+  } catch (error) {
+    console.error("Primary admin setup failed:", error);
+    throw new Error("تعذّر إنشاء حساب المدير الأساسي", { cause: error });
   }
 }
 
-export function authenticateStaffCredentials(input: {
+export async function authenticateStaffCredentials(input: {
   username: string;
   password: string;
-}): StaffSessionUser | null {
+}): Promise<StaffSessionUser | null> {
   const cleanUsername = normalizeUsername(input.username);
   if (!cleanUsername || !input.password) {
     return null;
   }
 
-  const db = getDb();
-  const row = db
-    .prepare(
-      `SELECT id, name, username, password_hash, password_salt, role, is_primary_admin
-       FROM staff_accounts
-       WHERE username = ?`,
-    )
-    .get(cleanUsername) as
-    | {
-        id: string;
-        name: string;
-        username: string;
-        password_hash: string;
-        password_salt: string;
-        role: StaffRole;
-        is_primary_admin: number;
-      }
-    | undefined;
+  try {
+    const db = getDb();
+    const rows = await db
+      .select({
+        id: staffAccounts.id,
+        name: staffAccounts.name,
+        username: staffAccounts.username,
+        passwordHash: staffAccounts.passwordHash,
+        passwordSalt: staffAccounts.passwordSalt,
+        role: staffAccounts.role,
+        isPrimaryAdmin: staffAccounts.isPrimaryAdmin,
+      })
+      .from(staffAccounts)
+      .where(eq(staffAccounts.username, cleanUsername))
+      .limit(1);
 
-  if (!row) {
-    // Perform an equivalent scrypt check to equalize timing when username does not exist.
-    scryptSync(input.password, DUMMY_SALT, 64);
-    return null;
+    const row = rows[0];
+    if (!row) {
+      scryptSync(input.password, DUMMY_SALT, 64);
+      return null;
+    }
+
+    if (!verifyPassword(input.password, row.passwordHash, row.passwordSalt)) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      name: row.name,
+      username: row.username,
+      role: row.role === "admin" ? "admin" : "teacher",
+      isPrimaryAdmin: row.isPrimaryAdmin,
+    };
+  } catch (error) {
+    console.error("Staff credential verification failed:", error);
+    throw new Error("تعذّر التحقق من بيانات الدخول", { cause: error });
   }
-
-  if (!verifyPassword(input.password, row.password_hash, row.password_salt)) {
-    return null;
-  }
-
-  return {
-    id: row.id,
-    name: row.name,
-    username: row.username,
-    role: row.role === "admin" ? "admin" : "teacher",
-    isPrimaryAdmin: row.is_primary_admin === 1,
-  };
 }
 
-export function listStaffAccounts(): StaffAccountView[] {
-  const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT id, name, username, role, is_primary_admin, created_at, updated_at
-       FROM staff_accounts
-       ORDER BY is_primary_admin DESC, created_at ASC`,
-    )
-    .all() as Array<Omit<StaffRow, "password_hash" | "password_salt" | "created_by_id">>;
-  return rows.map(toAccountView).sort((a, b) => {
-    if (a.isPrimaryAdmin !== b.isPrimaryAdmin) return a.isPrimaryAdmin ? -1 : 1;
-    return a.name.localeCompare(b.name, "ar");
-  });
+export async function listStaffAccounts(): Promise<StaffAccountView[]> {
+  try {
+    const db = getDb();
+    const rows = await db
+      .select({
+        id: staffAccounts.id,
+        name: staffAccounts.name,
+        username: staffAccounts.username,
+        role: staffAccounts.role,
+        isPrimaryAdmin: staffAccounts.isPrimaryAdmin,
+        createdAt: staffAccounts.createdAt,
+        updatedAt: staffAccounts.updatedAt,
+      })
+      .from(staffAccounts)
+      .orderBy(desc(staffAccounts.isPrimaryAdmin), asc(staffAccounts.createdAt));
+
+    return rows.map(toAccountView).sort((a, b) => {
+      if (a.isPrimaryAdmin !== b.isPrimaryAdmin) return a.isPrimaryAdmin ? -1 : 1;
+      return a.name.localeCompare(b.name, "ar");
+    });
+  } catch (error) {
+    console.error("Failed to list staff accounts:", error);
+    throw new Error("تعذّر تحميل قائمة الحسابات", { cause: error });
+  }
 }
 
-export function createStaffAccount(
+export async function createStaffAccount(
   actorId: string,
   input: { name: string; username: string; password: string; role: StaffRole },
-): { ok: true; account: StaffAccountView } | { ok: false; error: string; status: number } {
+): Promise<{ ok: true; account: StaffAccountView } | { ok: false; error: string; status: number }> {
   const validated = validateStaffAccountInput({
     name: input.name,
     username: input.username,
@@ -352,139 +393,189 @@ export function createStaffAccount(
   }
 
   const cleanUsername = normalizeUsername(input.username);
-  const db = getDb();
-  const existing = db
-    .prepare(`SELECT id FROM staff_accounts WHERE username = ?`)
-    .get(cleanUsername) as { id: string } | undefined;
-  if (existing) {
-    return { ok: false, error: "اسم المستخدم هذا مسجّل مسبقاً", status: 409 };
-  }
 
-  const id = randomUUID();
-  const nowIso = new Date().toISOString();
-  const { hash, salt } = hashPassword(input.password);
+  try {
+    const db = getDb();
+    const existing = await db
+      .select({ id: staffAccounts.id })
+      .from(staffAccounts)
+      .where(eq(staffAccounts.username, cleanUsername))
+      .limit(1);
 
-  db.prepare(
-    `INSERT INTO staff_accounts (
-      id, name, username, password_hash, password_salt, role, is_primary_admin, created_by_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-  ).run(id, validated.name, cleanUsername, hash, salt, validated.role, actorId, nowIso, nowIso);
+    if (existing.length > 0) {
+      return { ok: false, error: "اسم المستخدم هذا مسجّل مسبقاً", status: 409 };
+    }
 
-  return {
-    ok: true,
-    account: {
+    const id = randomUUID();
+    const nowIso = new Date().toISOString();
+    const { hash, salt } = hashPassword(input.password);
+
+    await db.insert(staffAccounts).values({
       id,
       name: validated.name,
       username: cleanUsername,
+      passwordHash: hash,
+      passwordSalt: salt,
       role: validated.role,
       isPrimaryAdmin: false,
+      createdById: actorId,
       createdAt: nowIso,
       updatedAt: nowIso,
-    },
-  };
+    });
+
+    return {
+      ok: true,
+      account: {
+        id,
+        name: validated.name,
+        username: cleanUsername,
+        role: validated.role,
+        isPrimaryAdmin: false,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+    };
+  } catch (error) {
+    console.error("Failed to create staff account:", error);
+    throw new Error("تعذّر إنشاء الحساب الجديد", { cause: error });
+  }
 }
 
-export function updateStaffAccount(
+export async function updateStaffAccount(
   actorId: string,
   accountId: string,
   patch: { name?: string; role?: StaffRole; password?: string },
-): { ok: true; account: StaffAccountView } | { ok: false; error: string; status: number } {
-  const db = getDb();
-  const target = db
-    .prepare(
-      `SELECT id, name, username, role, is_primary_admin, created_at, updated_at
-       FROM staff_accounts
-       WHERE id = ?`,
-    )
-    .get(accountId) as Omit<StaffRow, "password_hash" | "password_salt" | "created_by_id"> | undefined;
+): Promise<{ ok: true; account: StaffAccountView } | { ok: false; error: string; status: number }> {
+  try {
+    const db = getDb();
+    const targetRows = await db
+      .select({
+        id: staffAccounts.id,
+        name: staffAccounts.name,
+        username: staffAccounts.username,
+        role: staffAccounts.role,
+        isPrimaryAdmin: staffAccounts.isPrimaryAdmin,
+        createdAt: staffAccounts.createdAt,
+        updatedAt: staffAccounts.updatedAt,
+      })
+      .from(staffAccounts)
+      .where(eq(staffAccounts.id, accountId))
+      .limit(1);
 
-  if (!target) {
-    return { ok: false, error: "الحساب غير موجود", status: 404 };
-  }
-
-  const nextName = patch.name !== undefined ? patch.name : target.name;
-  const nextRole: StaffRole = patch.role !== undefined ? patch.role : target.role;
-  const hasNewPassword = typeof patch.password === "string" && patch.password.length > 0;
-
-  const validated = validateStaffAccountInput({
-    name: nextName,
-    username: target.username,
-    ...(hasNewPassword ? { password: patch.password } : {}),
-    role: nextRole,
-    requirePassword: hasNewPassword,
-  });
-  if (!validated.ok) {
-    return { ok: false, error: validated.error, status: 400 };
-  }
-
-  if (hasNewPassword) {
-    const pwd = patch.password ?? "";
-    if (pwd.length < STAFF_LIMITS.PASSWORD_MIN || pwd.length > STAFF_LIMITS.PASSWORD_MAX) {
-      return { ok: false, error: "كلمة المرور يجب أن تكون 6 أحرف على الأقل", status: 400 };
+    const target = targetRows[0];
+    if (!target) {
+      return { ok: false, error: "الحساب غير موجود", status: 404 };
     }
-  }
 
-  if (target.is_primary_admin === 1 && validated.role !== "admin") {
-    return { ok: false, error: "لا يمكن تغيير دور المدير الأساسي", status: 403 };
-  }
-  if (target.id === actorId && validated.role !== "admin") {
-    return { ok: false, error: "لا يمكنك إلغاء صلاحية الإدارة عن حسابك الحالي", status: 403 };
-  }
+    const targetRole: StaffRole = target.role === "admin" ? "admin" : "teacher";
+    const nextName = patch.name !== undefined ? patch.name : target.name;
+    const nextRole: StaffRole = patch.role !== undefined ? patch.role : targetRole;
+    const hasNewPassword = typeof patch.password === "string" && patch.password.length > 0;
 
-  const nowIso = new Date().toISOString();
-  if (hasNewPassword && patch.password) {
-    const { hash, salt } = hashPassword(patch.password);
-    db.prepare(
-      `UPDATE staff_accounts
-       SET name = ?, role = ?, password_hash = ?, password_salt = ?, updated_at = ?
-       WHERE id = ?`,
-    ).run(validated.name, validated.role, hash, salt, nowIso, target.id);
-  } else {
-    db.prepare(
-      `UPDATE staff_accounts
-       SET name = ?, role = ?, updated_at = ?
-       WHERE id = ?`,
-    ).run(validated.name, validated.role, nowIso, target.id);
-  }
-
-  db.prepare(`UPDATE attendance SET recorded_by_name = ? WHERE recorded_by_id = ?`).run(
-    validated.name,
-    target.id,
-  );
-
-  return {
-    ok: true,
-    account: {
-      id: target.id,
-      name: validated.name,
+    const validated = validateStaffAccountInput({
+      name: nextName,
       username: target.username,
-      role: validated.role,
-      isPrimaryAdmin: target.is_primary_admin === 1,
-      createdAt: target.created_at,
-      updatedAt: nowIso,
-    },
-  };
+      ...(hasNewPassword ? { password: patch.password } : {}),
+      role: nextRole,
+      requirePassword: hasNewPassword,
+    });
+    if (!validated.ok) {
+      return { ok: false, error: validated.error, status: 400 };
+    }
+
+    if (hasNewPassword) {
+      const pwd = patch.password ?? "";
+      if (pwd.length < STAFF_LIMITS.PASSWORD_MIN || pwd.length > STAFF_LIMITS.PASSWORD_MAX) {
+        return { ok: false, error: "كلمة المرور يجب أن تكون 6 أحرف على الأقل", status: 400 };
+      }
+    }
+
+    if (target.isPrimaryAdmin && validated.role !== "admin") {
+      return { ok: false, error: "لا يمكن تغيير دور المدير الأساسي", status: 403 };
+    }
+    if (target.id === actorId && validated.role !== "admin") {
+      return { ok: false, error: "لا يمكنك إلغاء صلاحية الإدارة عن حسابك الحالي", status: 403 };
+    }
+
+    const nowIso = new Date().toISOString();
+    await db.transaction(async (tx) => {
+      if (hasNewPassword && patch.password) {
+        const { hash, salt } = hashPassword(patch.password);
+        await tx
+          .update(staffAccounts)
+          .set({
+            name: validated.name,
+            role: validated.role,
+            passwordHash: hash,
+            passwordSalt: salt,
+            updatedAt: nowIso,
+          })
+          .where(eq(staffAccounts.id, target.id));
+      } else {
+        await tx
+          .update(staffAccounts)
+          .set({
+            name: validated.name,
+            role: validated.role,
+            updatedAt: nowIso,
+          })
+          .where(eq(staffAccounts.id, target.id));
+      }
+
+      await tx
+        .update(attendance)
+        .set({ recordedByName: validated.name })
+        .where(eq(attendance.recordedById, target.id));
+    });
+
+    return {
+      ok: true,
+      account: {
+        id: target.id,
+        name: validated.name,
+        username: target.username,
+        role: validated.role,
+        isPrimaryAdmin: target.isPrimaryAdmin,
+        createdAt: target.createdAt,
+        updatedAt: nowIso,
+      },
+    };
+  } catch (error) {
+    console.error("Failed to update staff account:", error);
+    throw new Error("تعذّر تحديث بيانات الحساب", { cause: error });
+  }
 }
 
-export function deleteStaffAccount(
+export async function deleteStaffAccount(
   actorId: string,
   accountId: string,
-): { ok: true } | { ok: false; error: string; status: number } {
-  const db = getDb();
-  const target = db
-    .prepare(`SELECT id, is_primary_admin FROM staff_accounts WHERE id = ?`)
-    .get(accountId) as { id: string; is_primary_admin: number } | undefined;
+): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
+  try {
+    const db = getDb();
+    const targetRows = await db
+      .select({
+        id: staffAccounts.id,
+        isPrimaryAdmin: staffAccounts.isPrimaryAdmin,
+      })
+      .from(staffAccounts)
+      .where(eq(staffAccounts.id, accountId))
+      .limit(1);
 
-  if (!target) {
-    return { ok: false, error: "الحساب غير موجود", status: 404 };
-  }
-  if (target.id === actorId) {
-    return { ok: false, error: "لا يمكنك حذف حسابك الحالي", status: 403 };
-  }
-  if (target.is_primary_admin === 1) {
-    return { ok: false, error: "لا يمكن حذف حساب المدير الأساسي", status: 403 };
-  }
+    const target = targetRows[0];
+    if (!target) {
+      return { ok: false, error: "الحساب غير موجود", status: 404 };
+    }
+    if (target.id === actorId) {
+      return { ok: false, error: "لا يمكنك حذف حسابك الحالي", status: 403 };
+    }
+    if (target.isPrimaryAdmin) {
+      return { ok: false, error: "لا يمكن حذف حساب المدير الأساسي", status: 403 };
+    }
 
-  db.prepare(`DELETE FROM staff_accounts WHERE id = ?`).run(target.id);
-  return { ok: true };
+    await db.delete(staffAccounts).where(eq(staffAccounts.id, target.id));
+    return { ok: true };
+  } catch (error) {
+    console.error("Failed to delete staff account:", error);
+    throw new Error("تعذّر حذف الحساب", { cause: error });
+  }
 }

@@ -254,22 +254,6 @@ export async function fetchAllAttendance(from?: string, to?: string): Promise<At
   return res.rows;
 }
 
-export async function importHistoricalAttendance(
-  qc: QueryClient,
-): Promise<{ studentsCreated: number; attendanceCreated: number }> {
-  const res = await apiJson<{ studentsCreated: number; attendanceCreated: number }>("/api/students", {
-    method: "POST",
-    body: JSON.stringify({ action: "import_seed" }),
-  });
-  await Promise.all([
-    qc.invalidateQueries({ queryKey: ["students"] }),
-    qc.invalidateQueries({ queryKey: ["attendance"] }),
-    qc.invalidateQueries({ queryKey: ["student-attendance"] }),
-    qc.invalidateQueries({ queryKey: ["public-results"] }),
-  ]);
-  return res;
-}
-
 export async function recordStudentPastDates(
   qc: QueryClient,
   student: Student,

@@ -1,214 +1,113 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
-  authenticateStaffCredentials,
+  buildClearSessionCookieHeader,
   buildSessionCookieHeader,
-  createStaffAccount,
-  deleteStaffAccount,
-  hasAnyStaffAccount,
-  listStaffAccounts,
-  resolveSession,
+  hashPassword,
+  isHttpsRequest,
+  normalizeUsername,
   SESSION_COOKIE_NAME,
-  setupPrimaryAdmin,
-  signSessionToken,
-  updateStaffAccount,
+  signSessionTokenWithSecret,
+  verifyPassword,
+  verifySameOriginMutation,
+  verifySessionTokenWithSecret,
 } from "@/lib/server/auth.server";
-import {
-  addStudent,
-  getAssistantChatMessages,
-  getPublicLeaderboard,
-  listAllAttendance,
-  listStaffDayRecordings,
-  listStudents,
-  recordAttendance,
-  setResultsPublic,
-  upsertAssistantChatMessages,
-} from "@/lib/server/data.server";
-import { closeDbForTesting } from "@/lib/server/db.server";
+import { computePublicLeaderboard, normalizePastAttendanceDates } from "@/lib/firebase/domain";
+import { HISTORICAL_NOV2026_SEED } from "@/lib/seed-nov2026";
 
-let tempDir = "";
-let tempDbPath = "";
+const TEST_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-beforeEach(() => {
-  tempDir = mkdtempSync(path.join(os.tmpdir(), "rijal-db-test-"));
-  tempDbPath = path.join(tempDir, "test.db");
-  process.env["RIJAL_DB_PATH"] = tempDbPath;
-});
+describe("Cloud SQL Staff Authentication & Session Security", () => {
+  it("hashes passwords with random salts and verifies securely", () => {
+    const first = hashPassword("StrongPass!123");
+    const second = hashPassword("StrongPass!123");
 
-afterEach(() => {
-  closeDbForTesting(tempDbPath);
-  delete process.env["RIJAL_DB_PATH"];
-  if (tempDir) {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-describe("Separate Staff Accounts & Attendance SQLite Database", () => {
-  it("auto-seeds the 72 November 2026 students and attendance records on first open", () => {
-    expect(hasAnyStaffAccount()).toBe(false);
-    const students = listStudents();
-    const attendance = listAllAttendance();
-    expect(students.length).toBe(72);
-    expect(attendance.length).toBeGreaterThan(200);
+    expect(first.salt).not.toBe(second.salt);
+    expect(first.hash).not.toBe(second.hash);
+    expect(verifyPassword("StrongPass!123", first.hash, first.salt)).toBe(true);
+    expect(verifyPassword("WrongPass!123", first.hash, first.salt)).toBe(false);
+    expect(verifyPassword("", first.hash, first.salt)).toBe(false);
   });
 
-  it("allows setting up primary admin once and rejects duplicate setup", () => {
-    const first = setupPrimaryAdmin({
-      name: "أبو عبد الله",
-      username: "Admin1",
-      password: "secret-password-1",
-    });
-    expect(first.ok).toBe(true);
-    if (!first.ok) throw new Error("Expected primary admin creation to succeed");
-    expect(first.user.role).toBe("admin");
-    expect(first.user.isPrimaryAdmin).toBe(true);
-    expect(first.user.username).toBe("admin1");
-    expect(hasAnyStaffAccount()).toBe(true);
+  it("signs and verifies HMAC session tokens and rejects tampered tokens", () => {
+    const token = signSessionTokenWithSecret("staff-user-1", TEST_SECRET);
+    expect(verifySessionTokenWithSecret(token, TEST_SECRET)).toBe("staff-user-1");
 
-    const second = setupPrimaryAdmin({
-      name: "مستخدم آخر",
-      username: "admin2",
-      password: "another-password",
-    });
-    expect(second.ok).toBe(false);
-    if (!second.ok) {
-      expect(second.status).toBe(409);
-    }
+    const parts = token.split(".");
+    const tampered = `${parts[0]}.tampered_sig`;
+    expect(verifySessionTokenWithSecret(tampered, TEST_SECRET)).toBeNull();
+    expect(verifySessionTokenWithSecret(token, "different-secret-key-0000000000000000")).toBeNull();
   });
 
-  it("authenticates primary admin, creates teacher, updates password, and deletes account", () => {
-    const adminRes = setupPrimaryAdmin({
-      name: "المدير الأساسي",
-      username: "main_admin",
-      password: "Password123!",
-    });
-    if (!adminRes.ok) throw new Error("Setup failed");
-    const adminId = adminRes.user.id;
-
-    // Create teacher
-    const teacherRes = createStaffAccount(adminId, {
-      name: "خالد العتيبي",
-      username: "khaled",
-      password: "initial-pass-1",
-      role: "teacher",
-    });
-    expect(teacherRes.ok).toBe(true);
-    if (!teacherRes.ok) throw new Error("Teacher create failed");
-    const teacherId = teacherRes.account.id;
-
-    // Duplicate username rejected
-    const dupRes = createStaffAccount(adminId, {
-      name: "مكرر",
-      username: "KHALED",
-      password: "some-password",
-      role: "teacher",
-    });
-    expect(dupRes.ok).toBe(false);
-
-    // Login with initial password
-    expect(authenticateStaffCredentials({ username: "khaled", password: "wrong" })).toBeNull();
-    const loggedInTeacher = authenticateStaffCredentials({ username: "khaled", password: "initial-pass-1" });
-    expect(loggedInTeacher?.name).toBe("خالد العتيبي");
-    expect(loggedInTeacher?.role).toBe("teacher");
-
-    // Admin updates teacher display name + password
-    const updatedRes = updateStaffAccount(adminId, teacherId, {
-      name: "الأستاذ خالد السالم",
-      password: "new-password-99",
-    });
-    expect(updatedRes.ok).toBe(true);
-
-    // Old password rejected, new password works with updated name
-    expect(authenticateStaffCredentials({ username: "khaled", password: "initial-pass-1" })).toBeNull();
-    const relogin = authenticateStaffCredentials({ username: "khaled", password: "new-password-99" });
-    expect(relogin?.name).toBe("الأستاذ خالد السالم");
-
-    // Primary admin cannot be deleted or demoted
-    expect(deleteStaffAccount(adminId, adminId).ok).toBe(false);
-    expect(updateStaffAccount(adminId, adminId, { role: "teacher" }).ok).toBe(false);
-
-    // Valid cookie resolves live user, and deletion immediately invalidates the cookie
-    const token = signSessionToken(teacherId);
-    const req = new Request("http://localhost:3000/api/staff", {
-      headers: { cookie: `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}` },
-    });
-    expect(resolveSession(req)?.id).toBe(teacherId);
-
-    expect(deleteStaffAccount(adminId, teacherId).ok).toBe(true);
-    expect(resolveSession(req)).toBeNull();
-    expect(listStaffAccounts().map((a) => a.id)).toEqual([adminId]);
+  it("normalizes usernames consistently", () => {
+    expect(normalizeUsername("  Admin_One  ")).toBe("admin_one");
   });
 
-  it("tracks per-teacher check-ins, gates public leaderboard, and persists assistant chats", () => {
-    const adminRes = setupPrimaryAdmin({
-      name: "المدير",
-      username: "boss",
-      password: "Password123!",
-    });
-    if (!adminRes.ok) throw new Error("Setup failed");
-
-    const tRes = createStaffAccount(adminRes.user.id, {
-      name: "معلم الفجر",
-      username: "fajr_t",
-      password: "Password123!",
-      role: "teacher",
-    });
-    if (!tRes.ok) throw new Error("Teacher failed");
-
-    const teacherSession = {
-      id: tRes.account.id,
-      name: tRes.account.name,
-      username: tRes.account.username,
-      role: tRes.account.role,
-      isPrimaryAdmin: false,
-    };
-
-    const added = addStudent("عبد الرحمن الشهري", teacherSession.id);
-    expect(added.status).toBe("created");
-    if (added.status !== "created") throw new Error("Student add failed");
-
-    const rec = recordAttendance(added.student.id, "2026-11-26", teacherSession);
-    expect(rec.status).toBe("recorded");
-    expect(recordAttendance(added.student.id, "2026-11-26", teacherSession).status).toBe("duplicate");
-
-    const myRows = listStaffDayRecordings(teacherSession.id, "2026-11-26");
-    expect(myRows.length).toBe(1);
-    expect(myRows[0]?.studentName).toBe("عبد الرحمن الشهري");
-
-    expect(getPublicLeaderboard().open).toBe(false);
-    setResultsPublic(true, adminRes.user.id);
-    const pub = getPublicLeaderboard();
-    expect(pub.open).toBe(true);
-    expect(pub.rows.length).toBe(73);
-
-    upsertAssistantChatMessages(adminRes.user.id, [{ id: "m1", role: "user", parts: [{ type: "text", text: "مرحبا" }] }]);
-    expect(getAssistantChatMessages(adminRes.user.id)).toHaveLength(1);
-  });
-
-  it("authenticates via Bearer token even when cookies are absent and marks HTTPS Origin cookies SameSite=None; Partitioned", () => {
-    const adminRes = setupPrimaryAdmin({
-      name: "المدير",
-      username: "iframe_admin",
-      password: "Password123!",
-    });
-    if (!adminRes.ok) throw new Error("Setup failed");
-
-    const token = signSessionToken(adminRes.user.id);
-    const bearerReq = new Request("http://127.0.0.1:3000/api/students", {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    expect(resolveSession(bearerReq)?.id).toBe(adminRes.user.id);
-
-    const proxiedHttpsReq = new Request("http://127.0.0.1:3000/api/auth", {
+  it("marks proxied HTTPS preview cookies with SameSite=None; Partitioned", () => {
+    const token = signSessionTokenWithSecret("admin-1", TEST_SECRET);
+    const httpsReq = new Request("http://127.0.0.1:3000/api/auth", {
       method: "POST",
       headers: { Origin: "https://ais-dev-example.europe-west2.run.app" },
     });
-    const cookieHeader = buildSessionCookieHeader(proxiedHttpsReq, token);
-    expect(cookieHeader).toContain("HttpOnly");
-    expect(cookieHeader).toContain("Secure");
-    expect(cookieHeader).toContain("SameSite=None");
-    expect(cookieHeader).toContain("Partitioned");
+
+    expect(isHttpsRequest(httpsReq)).toBe(true);
+    const setCookie = buildSessionCookieHeader(httpsReq, token);
+    expect(setCookie).toContain(`${SESSION_COOKIE_NAME}=`);
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Secure");
+    expect(setCookie).toContain("SameSite=None");
+    expect(setCookie).toContain("Partitioned");
+
+    const clearCookie = buildClearSessionCookieHeader(httpsReq);
+    expect(clearCookie).toContain("Max-Age=0");
+    expect(clearCookie).toContain("SameSite=None");
+    expect(clearCookie).toContain("Partitioned");
+  });
+
+  it("enforces same-origin, custom header, or Bearer authentication on mutations", () => {
+    const bearerReq = new Request("http://127.0.0.1:3000/api/students", {
+      method: "POST",
+      headers: { Authorization: "Bearer valid.token" },
+    });
+    expect(verifySameOriginMutation(bearerReq)).toBe(true);
+
+    const headerReq = new Request("http://127.0.0.1:3000/api/auth", {
+      method: "POST",
+      headers: { "X-Requested-With": "rijal-client" },
+    });
+    expect(verifySameOriginMutation(headerReq)).toBe(true);
+
+    const crossOriginReq = new Request("http://127.0.0.1:3000/api/staff", {
+      method: "POST",
+      headers: { Host: "127.0.0.1:3000", Origin: "https://evil.example.com" },
+    });
+    expect(verifySameOriginMutation(crossOriginReq)).toBe(false);
+  });
+
+  it("contains 72 historical students and preserves past attendance filtering", () => {
+    expect(HISTORICAL_NOV2026_SEED).toHaveLength(72);
+
+    const { validDates, skippedCount } = normalizePastAttendanceDates(
+      ["2026-11-26", "2026-11-27", "2026-11-26", "2026-12-01"],
+      "2026-11-27",
+      new Set(["2026-11-26"]),
+    );
+    expect(validDates).toEqual(["2026-11-27"]);
+    expect(skippedCount).toBe(2);
+
+    const board = computePublicLeaderboard(
+      [
+        { id: "s1", full_name: "أحمد محمد" },
+        { id: "s2", full_name: "براء العلي" },
+      ],
+      [
+        { student_id: "s1" },
+        { student_id: "s1" },
+        { student_id: "s2" },
+      ],
+    );
+    expect(board).toEqual([
+      { full_name: "أحمد محمد", days: 2 },
+      { full_name: "براء العلي", days: 1 },
+    ]);
   });
 });

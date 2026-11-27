@@ -10,41 +10,53 @@ export const Route = createFileRoute("/api/settings")({
   server: {
     handlers: {
       GET: async ({ request }) => {
-        const url = new URL(request.url);
-        if (url.searchParams.get("public") === "1") {
-          return Response.json(getPublicLeaderboard(), {
-            headers: { "cache-control": "no-store" },
-          });
+        try {
+          const url = new URL(request.url);
+          if (url.searchParams.get("public") === "1") {
+            const leaderboard = await getPublicLeaderboard();
+            return Response.json(leaderboard, {
+              headers: { "cache-control": "no-store" },
+            });
+          }
+
+          const session = await resolveSession(request);
+          if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
+          if (session.role !== "admin") return jsonError(403, "هذه الصفحة متاحة للمدير فقط");
+
+          const resultsPublic = await getResultsPublic();
+          return Response.json(
+            { results_public: resultsPublic },
+            { headers: { "cache-control": "no-store" } },
+          );
+        } catch (error) {
+          console.error("GET /api/settings error:", error);
+          return jsonError(500, error instanceof Error ? error.message : "تعذّر تحميل الإعدادات");
         }
-
-        const session = resolveSession(request);
-        if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
-        if (session.role !== "admin") return jsonError(403, "هذه الصفحة متاحة للمدير فقط");
-
-        return Response.json(
-          { results_public: getResultsPublic() },
-          { headers: { "cache-control": "no-store" } },
-        );
       },
 
       PUT: async ({ request }) => {
         if (!verifySameOriginMutation(request)) {
           return jsonError(403, "طلب غير مصرّح به");
         }
-        const session = resolveSession(request);
-        if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
-        if (session.role !== "admin") return jsonError(403, "هذه العملية متاحة للمدير فقط");
-
-        let body: Record<string, unknown>;
         try {
-          body = (await request.json()) as Record<string, unknown>;
-        } catch {
-          return jsonError(400, "بيانات الطلب غير صالحة");
-        }
+          const session = await resolveSession(request);
+          if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
+          if (session.role !== "admin") return jsonError(403, "هذه العملية متاحة للمدير فقط");
 
-        const value = Boolean(body["results_public"]);
-        setResultsPublic(value, session.id);
-        return Response.json({ ok: true, results_public: value });
+          let body: Record<string, unknown>;
+          try {
+            body = (await request.json()) as Record<string, unknown>;
+          } catch {
+            return jsonError(400, "بيانات الطلب غير صالحة");
+          }
+
+          const value = Boolean(body["results_public"]);
+          await setResultsPublic(value, session.id);
+          return Response.json({ ok: true, results_public: value });
+        } catch (error) {
+          console.error("PUT /api/settings error:", error);
+          return jsonError(500, error instanceof Error ? error.message : "تعذّر حفظ الإعدادات");
+        }
       },
     },
   },

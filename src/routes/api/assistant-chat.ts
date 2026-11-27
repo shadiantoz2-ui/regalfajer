@@ -10,26 +10,34 @@ export const Route = createFileRoute("/api/assistant-chat")({
   server: {
     handlers: {
       GET: async ({ request }) => {
-        const session = resolveSession(request);
-        if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
-        if (session.role !== "admin") return jsonError(403, "المساعد متاح للمدير فقط");
+        try {
+          const session = await resolveSession(request);
+          if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
+          if (session.role !== "admin") return jsonError(403, "المساعد متاح للمدير فقط");
 
-        return Response.json(
-          { messages: getAssistantChatMessages(session.id) },
-          { headers: { "cache-control": "no-store" } },
-        );
+          const messages = await getAssistantChatMessages(session.id);
+          return Response.json({ messages }, { headers: { "cache-control": "no-store" } });
+        } catch (error) {
+          console.error("GET /api/assistant-chat error:", error);
+          return jsonError(500, error instanceof Error ? error.message : "تعذّر تحميل المحادثة");
+        }
       },
 
       DELETE: async ({ request }) => {
         if (!verifySameOriginMutation(request)) {
           return jsonError(403, "طلب غير مصرّح به");
         }
-        const session = resolveSession(request);
-        if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
-        if (session.role !== "admin") return jsonError(403, "المساعد متاح للمدير فقط");
+        try {
+          const session = await resolveSession(request);
+          if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
+          if (session.role !== "admin") return jsonError(403, "المساعد متاح للمدير فقط");
 
-        clearAssistantChatMessages(session.id);
-        return Response.json({ ok: true });
+          await clearAssistantChatMessages(session.id);
+          return Response.json({ ok: true });
+        } catch (error) {
+          console.error("DELETE /api/assistant-chat error:", error);
+          return jsonError(500, error instanceof Error ? error.message : "تعذّر مسح المحادثة");
+        }
       },
     },
   },
