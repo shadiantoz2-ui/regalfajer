@@ -23,7 +23,11 @@ import {
   type NameMatch,
 } from "@/lib/arabic";
 import { recordWav, type WavRecording } from "@/lib/record-wav";
-import { isServerTranscriptionConfigured, transcribeAudio } from "@/lib/transcribe-client";
+import {
+  isServerTranscriptionConfigured,
+  isServerTranscriptionCoolingDown,
+  transcribeAudio,
+} from "@/lib/transcribe-client";
 import type { Student } from "@/lib/types";
 
 type BrowserSpeechAlternative = { transcript?: string; confidence?: number };
@@ -66,7 +70,13 @@ type Phase =
   | { kind: "saving"; name: string }
   | { kind: "done"; name: string }
   | { kind: "duplicate"; name: string; reason: "attendance" | "student" }
-  | { kind: "error"; message: string; canRetryAudio?: boolean };
+  | {
+      kind: "error";
+      message: string;
+      canRetryAudio?: boolean;
+      canFallbackBrowser?: boolean;
+      canFallbackServer?: boolean;
+    };
 
 const MAX_SECONDS = 8;
 const WAVE_WEIGHTS = [0.45, 0.72, 0.92, 1.0, 0.88, 0.68, 0.42];
@@ -108,6 +118,7 @@ export function VoiceNamePicker({
   const speechErrorRef = useRef("");
   const speechEndedRef = useRef(false);
   const serverConfiguredRef = useRef<boolean | null>(null);
+  const inFlightSaveRef = useRef(false);
   const timersRef = useRef<number[]>([]);
 
   const clearTimers = () => {
@@ -116,9 +127,11 @@ export function VoiceNamePicker({
   };
 
   useEffect(() => {
-    void isServerTranscriptionConfigured().then((ok) => {
-      serverConfiguredRef.current = ok;
-    });
+    if (!getSpeechRecognitionCtor()) {
+      void isServerTranscriptionConfigured().then((ok) => {
+        serverConfiguredRef.current = ok;
+      });
+    }
     return () => {
       clearTimers();
       recRef.current?.cancel();
@@ -131,7 +144,7 @@ export function VoiceNamePicker({
     if (phase.kind === "done" || phase.kind === "duplicate") {
       const t = window.setTimeout(
         () => setPhase({ kind: "idle" }),
-        phase.kind === "done" ? 3500 : 5000,
+        phase.kind === "done" ? 1600 : 4000,
       );
       return () => window.clearTimeout(t);
     }
@@ -199,14 +212,28 @@ export function VoiceNamePicker({
       resolveVoice(formatted);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "تعذّر التعرف على الصوت، حاول مرة أخرى";
+      const errStatus =
+        typeof e === "object" && e !== null && "status" in e && typeof e.status === "number" ? e.status : 0;
+      const errCode =
+        typeof e === "object" && e !== null && "code" in e && typeof e.code === "string" ? e.code : "";
       const isConfigErr = msg.includes("غير مفعّلة") || msg.includes("مفتاح") || msg.includes("الجلسة");
-      if (getSpeechRecognitionCtor() && isConfigErr) {
+      const isQuotaOrLoadErr =
+        errStatus === 429 ||
+        errStatus === 503 ||
+        errStatus === 504 ||
+        errCode === "QUOTA_EXCEEDED" ||
+        msg.includes("الحد المؤقت") ||
+        msg.includes("طلبات كثيرة") ||
+        msg.includes("الضغط");
+      const hasBrowserSpeech = Boolean(getSpeechRecognitionCtor());
+      if (hasBrowserSpeech && isConfigErr) {
         serverConfiguredRef.current = false;
       }
       setPhase({
         kind: "error",
         message: msg,
         canRetryAudio: !isConfigErr,
+        canFallbackBrowser: hasBrowserSpeech && (isQuotaOrLoadErr || isConfigErr || errStatus >= 500 || errStatus === 0),
       });
     }
   };
@@ -277,8 +304,7 @@ export function VoiceNamePicker({
         if (!startSpeechRecognition("ar", false)) {
           setPhase({
             kind: "error",
-            message:
-              "متصفحك لا يدعم التعرف على الصوت بالعربية، يمكنك كتابة الاسم يدوياً أو تفعيل GEMINI_API_KEY في الإعدادات",
+            message: "متصفحك لا يدعم التعرف على الصوت بالعربية، يمكنك كتابة الاسم يدوياً",
           });
         }
       }
@@ -343,21 +369,10 @@ export function VoiceNamePicker({
   };
 
   const start = async () => {
-    let serverReady = serverConfiguredRef.current;
-    if (serverReady === null) {
-      serverReady = await isServerTranscriptionConfigured();
-      serverConfiguredRef.current = serverReady;
-    }
-
-    if (serverReady) {
-      await startRecordingWav();
+    setTyping(false);
+    if (getSpeechRecognitionCtor() && startSpeechRecognition("ar-SA", true)) {
       return;
     }
-
-    if (getSpeechRecognitionCtor()) {
-      if (startSpeechRecognition("ar-SA", true)) return;
-    }
-
     await startRecordingWav();
   };
 
@@ -413,11 +428,15 @@ export function VoiceNamePicker({
       if (!heard && (err === "network" || err === "service-not-allowed" || err === "language-not-supported")) {
         const configured = serverConfiguredRef.current ?? (await isServerTranscriptionConfigured());
         serverConfiguredRef.current = configured;
+        const coolingDown =
+          typeof isServerTranscriptionCoolingDown === "function" ? isServerTranscriptionCoolingDown() : false;
+        const canUseServer = configured && !coolingDown;
         setPhase({
           kind: "error",
-          message: configured
-            ? "تعذّر التعرف المباشر من المتصفح، اضغط حاول مرة أخرى لاستخدام الخادم"
-            : "متصفحك أو الشبكة لا تدعم التعرف الصوتي المباشر، اكتب الاسم يدوياً أو فعّل GEMINI_API_KEY في الإعدادات",
+          message: canUseServer
+            ? "تعذّر التعرف المباشر من المتصفح، يمكنك استخدام التسجيل عبر الخادم أو كتابة الاسم يدوياً"
+            : "متصفحك أو الشبكة لا تدعم التعرف الصوتي المباشر حالياً، يمكنك إعادة المحاولة أو كتابة الاسم يدوياً",
+          canFallbackServer: canUseServer,
         });
         return;
       }
@@ -444,6 +463,8 @@ export function VoiceNamePicker({
   };
 
   const confirm = async (student: Student) => {
+    if (inFlightSaveRef.current) return;
+    inFlightSaveRef.current = true;
     setPhase({ kind: "saving", name: student.full_name });
     try {
       const res = await onConfirm(student);
@@ -454,27 +475,34 @@ export function VoiceNamePicker({
       );
     } catch {
       setPhase({ kind: "error", message: "تعذّر الحفظ، حاول مرة أخرى" });
+    } finally {
+      inFlightSaveRef.current = false;
     }
   };
 
   const registerName = async (rawName: string) => {
+    if (inFlightSaveRef.current) return;
     const name = cleanDisplayName(rawName);
     if (name.split(" ").length < 2) {
       setEditingHeard(true);
       setHeardError("اكتب الاسم والكنية على الأقل قبل الإضافة");
       return;
     }
+    inFlightSaveRef.current = true;
     setHeardError("");
     setPhase({ kind: "saving", name });
     try {
       const res = await onRegister(name);
       if (res.status === "duplicate") {
+        inFlightSaveRef.current = false;
         if (res.student) await confirm(res.student);
         else setPhase({ kind: "duplicate", name, reason: "student" });
         return;
       }
+      inFlightSaveRef.current = false;
       await confirm(res.student);
     } catch {
+      inFlightSaveRef.current = false;
       setPhase({ kind: "error", message: "تعذّر تسجيل الطالب، حاول مرة أخرى" });
     }
   };
@@ -826,9 +854,35 @@ export function VoiceNamePicker({
           <AlertTriangle className="size-12 text-dawn" />
           <p className="mt-4 text-lg">{phase.message}</p>
           <div className="mt-6 flex flex-wrap justify-center gap-3">
-            {phase.canRetryAudio && lastAudioFileRef.current && (
+            {phase.canFallbackBrowser && (
               <Button
                 variant="gold"
+                size="xl"
+                onClick={() => {
+                  lastAudioFileRef.current = null;
+                  if (!startSpeechRecognition("ar-SA", true)) {
+                    reset();
+                  }
+                }}
+              >
+                <Mic className="size-5" /> التسجيل المباشر عبر المتصفح
+              </Button>
+            )}
+            {phase.canFallbackServer && (
+              <Button
+                variant="gold"
+                size="xl"
+                onClick={() => {
+                  lastAudioFileRef.current = null;
+                  void startRecordingWav();
+                }}
+              >
+                <Mic className="size-5" /> التسجيل عبر الخادم
+              </Button>
+            )}
+            {phase.canRetryAudio && lastAudioFileRef.current && (
+              <Button
+                variant={phase.canFallbackBrowser ? "glass" : "gold"}
                 size="xl"
                 onClick={() => {
                   const file = lastAudioFileRef.current;
@@ -838,7 +892,11 @@ export function VoiceNamePicker({
                 <RefreshCw className="size-5" /> إعادة المحاولة بنفس التسجيل
               </Button>
             )}
-            <Button variant={phase.canRetryAudio ? "glass" : "gold"} size="xl" onClick={reset}>
+            <Button
+              variant={phase.canRetryAudio || phase.canFallbackBrowser || phase.canFallbackServer ? "glass" : "gold"}
+              size="xl"
+              onClick={reset}
+            >
               <RotateCcw className="size-5" /> حاول مرة أخرى
             </Button>
             <Button

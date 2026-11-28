@@ -10,6 +10,8 @@ import {
   EyeOff,
   KeyRound,
   Loader2,
+  Lock,
+  LockOpen,
   Pencil,
   ShieldCheck,
   Trash2,
@@ -44,6 +46,7 @@ import {
   createStaffAccountApi,
   deleteStaffAccountApi,
   setResultsPublic,
+  setTeacherEntryEnabledApi,
   settingsQuery,
   staffAccountsQuery,
   teacherDayRecordingsQuery,
@@ -94,6 +97,7 @@ function AdminPage() {
   const [busy, setBusy] = useState(false);
 
   const [toggling, setToggling] = useState(false);
+  const [togglingTeacherEntry, setTogglingTeacherEntry] = useState(false);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
   // Edit / Password reset dialog state
@@ -120,6 +124,7 @@ function AdminPage() {
   const [confirmDeleteAccount, setConfirmDeleteAccount] = useState<StaffAccountView | null>(null);
 
   const isPublic = settings.data?.results_public ?? false;
+  const teacherEntryEnabled = settings.data?.teacher_entry_enabled ?? true;
 
   const toggle = async (value: boolean) => {
     setToggling(true);
@@ -134,6 +139,22 @@ function AdminPage() {
       toast.error("تعذّر التغيير");
     } finally {
       setToggling(false);
+    }
+  };
+
+  const toggleTeacherEntry = async (value: boolean) => {
+    setTogglingTeacherEntry(true);
+    try {
+      await setTeacherEntryEnabledApi(value);
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["settings"] }),
+        qc.invalidateQueries({ queryKey: ["teacher-entry"] }),
+      ]);
+      toast.success(value ? "تم السماح للمعلمين بإدخال البيانات" : "تم منع المعلمين من إدخال البيانات");
+    } catch {
+      toast.error("تعذّر تحديث صلاحية المعلمين");
+    } finally {
+      setTogglingTeacherEntry(false);
     }
   };
 
@@ -354,6 +375,76 @@ function AdminPage() {
           <Link to="/" className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-primary">
             <ExternalLink className="size-3.5" /> معاينة صفحة النتائج الخارجية
           </Link>
+        </div>
+      </section>
+
+      <section
+        className={cn(
+          "mt-6 rounded-[2rem] border p-6 surface transition-colors",
+          teacherEntryEnabled ? "border-success/40" : "border-destructive/40",
+        )}
+      >
+        <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3.5">
+            <div
+              className={cn(
+                "grid size-12 shrink-0 place-items-center rounded-2xl border",
+                teacherEntryEnabled
+                  ? "border-success/40 bg-success/15 text-success"
+                  : "border-destructive/40 bg-destructive/15 text-destructive",
+              )}
+            >
+              {teacherEntryEnabled ? <LockOpen className="size-6" /> : <Lock className="size-6" />}
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="font-display text-xl">إدخال البيانات للمعلمين</h2>
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-lg px-2.5 py-0.5 text-xs font-semibold",
+                    teacherEntryEnabled ? "bg-success/15 text-success" : "bg-destructive/15 text-destructive",
+                  )}
+                >
+                  <span className={cn("size-2 rounded-full", teacherEntryEnabled ? "bg-success" : "bg-destructive")} />
+                  {teacherEntryEnabled ? "مسموح حالياً" : "ممنوع حالياً"}
+                </span>
+              </div>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {teacherEntryEnabled
+                  ? "يستطيع المعلمون تسجيل حضور الطلاب وإضافة أسماء جديدة الآن"
+                  : "المعلمون ممنوعون من تسجيل الحضور أو إضافة الطلاب؛ الإدخال متاح للمديرين فقط"}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 self-end sm:self-center">
+            <Switch
+              checked={teacherEntryEnabled}
+              disabled={settings.isLoading || togglingTeacherEntry}
+              onCheckedChange={toggleTeacherEntry}
+              aria-label="السماح للمعلمين بإدخال البيانات"
+            />
+            <Button
+              type="button"
+              variant={teacherEntryEnabled ? "glass" : "gold"}
+              size="lg"
+              disabled={settings.isLoading || togglingTeacherEntry}
+              onClick={() => void toggleTeacherEntry(!teacherEntryEnabled)}
+              className={cn(
+                "min-w-[12rem] rounded-xl font-semibold",
+                teacherEntryEnabled && "border-destructive/40 text-destructive hover:bg-destructive/15",
+              )}
+            >
+              {togglingTeacherEntry ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : teacherEntryEnabled ? (
+                <Lock className="size-4" />
+              ) : (
+                <LockOpen className="size-4" />
+              )}
+              {teacherEntryEnabled ? "منع المعلمين من الإدخال" : "السماح للمعلمين بالإدخال"}
+            </Button>
+          </div>
         </div>
       </section>
 

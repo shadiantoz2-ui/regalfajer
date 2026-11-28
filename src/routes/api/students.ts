@@ -1,6 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { canRoleEnterData, TEACHER_ENTRY_BLOCKED_MESSAGE } from "@/lib/firebase/domain";
 import { resolveSession, verifySameOriginMutation } from "@/lib/server/auth.server";
-import { addStudent, deleteStudent, listStudents, renameStudent } from "@/lib/server/data.server";
+import {
+  addStudent,
+  addStudentsBulk,
+  deleteStudent,
+  getTeacherEntryEnabled,
+  listStudents,
+  renameStudent,
+} from "@/lib/server/data.server";
 
 function jsonError(status: number, message: string) {
   return Response.json({ error: { message } }, { status });
@@ -28,12 +36,23 @@ export const Route = createFileRoute("/api/students")({
         try {
           const session = await resolveSession(request);
           if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
+          if (!canRoleEnterData(session.role, await getTeacherEntryEnabled())) {
+            return jsonError(403, TEACHER_ENTRY_BLOCKED_MESSAGE);
+          }
 
           let body: Record<string, unknown>;
           try {
             body = (await request.json()) as Record<string, unknown>;
           } catch {
             return jsonError(400, "بيانات الطلب غير صالحة");
+          }
+
+          if (body["mode"] === "bulk") {
+            const rawNames = Array.isArray(body["names"])
+              ? body["names"].filter((n): n is string => typeof n === "string").slice(0, 1000)
+              : [];
+            const result = await addStudentsBulk(rawNames, session.id);
+            return Response.json(result, { status: result.created.length > 0 ? 201 : 200 });
           }
 
           const fullName = typeof body["fullName"] === "string" ? body["fullName"] : "";

@@ -7,6 +7,7 @@ import {
   CalendarPlus,
   ListPlus,
   Loader2,
+  Lock,
   Pencil,
   Plus,
   Search,
@@ -33,8 +34,10 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { ApiError } from "@/lib/api-client";
 import {
   addStudent,
+  addStudentsBulk,
   deleteStudent,
   recordAttendance,
   recordAttendanceBulk,
@@ -42,6 +45,7 @@ import {
   renameStudent,
   studentAttendanceQuery,
   studentsQuery,
+  teacherEntryQuery,
 } from "@/lib/data";
 import {
   cleanDisplayName,
@@ -75,6 +79,8 @@ function StudentsPage() {
   const { role, userName } = Route.useRouteContext();
   const isAdmin = role === "admin";
   const studentsResult = useQuery({ ...studentsQuery(), enabled: isAdmin });
+  const entrySetting = useQuery({ ...teacherEntryQuery(), enabled: role === "teacher" });
+  const teacherEntryBlocked = role === "teacher" && entrySetting.data?.teacher_entry_enabled === false;
   const students = useMemo(() => studentsResult.data ?? [], [studentsResult.data]);
   const qc = useQueryClient();
 
@@ -206,8 +212,13 @@ function StudentsPage() {
         await refresh();
         setPendingTodayAttendance([res.student]);
       }
-    } catch {
-      toast.error("تعذّرت الإضافة، حاول مرة أخرى");
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        void qc.invalidateQueries({ queryKey: ["teacher-entry"] });
+        toast.error(err.message);
+      } else {
+        toast.error("تعذّرت الإضافة، حاول مرة أخرى");
+      }
     } finally {
       setBusy(false);
     }
@@ -220,14 +231,8 @@ function StudentsPage() {
       .filter((n) => n.split(" ").length >= 2);
     if (!names.length) return;
     setBusy(true);
-    const created: Student[] = [];
-    const duplicates: string[] = [];
     try {
-      for (const n of names) {
-        const res = await addStudent(n);
-        if (res.status === "created") created.push(res.student);
-        else if (res.status === "duplicate") duplicates.push(n);
-      }
+      const { created, duplicates } = await addStudentsBulk(names);
       setDupes(duplicates);
       if (created.length) {
         toast.success(`تمت إضافة ${created.length} طالب`);
@@ -236,8 +241,13 @@ function StudentsPage() {
       setBulk("");
       setBulkOpen(false);
       await refresh();
-    } catch {
-      toast.error("تعذّرت الإضافة، حاول مرة أخرى");
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        void qc.invalidateQueries({ queryKey: ["teacher-entry"] });
+        toast.error(err.message);
+      } else {
+        toast.error("تعذّرت الإضافة، حاول مرة أخرى");
+      }
     } finally {
       setBusy(false);
     }
@@ -265,8 +275,13 @@ function StudentsPage() {
       await qc.invalidateQueries({ queryKey: ["attendance", today] });
       void qc.invalidateQueries({ queryKey: ["my-day-recordings", today] });
       void qc.invalidateQueries({ queryKey: ["public-results"] });
-    } catch {
-      toast.error("تعذّر تسجيل حضور اليوم");
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        void qc.invalidateQueries({ queryKey: ["teacher-entry"] });
+        toast.error(err.message);
+      } else {
+        toast.error("تعذّر تسجيل حضور اليوم");
+      }
     } finally {
       setMarkingToday(false);
       setPendingTodayAttendance([]);
@@ -311,10 +326,21 @@ function StudentsPage() {
 
   return (
     <AppShell compact role={role} userName={userName}>
-      <section className="rounded-[2rem] p-6 surface">
-        <h2 className="font-display flex items-center gap-2 text-2xl">
-          <UserPlus className="size-6 text-primary" /> إضافة طالب
-        </h2>
+      {teacherEntryBlocked ? (
+        <section role="status" className="rounded-[2rem] border border-destructive/40 p-8 text-center surface">
+          <div className="mx-auto grid size-16 place-items-center rounded-full border border-destructive/40 bg-destructive/15 text-destructive">
+            <Lock className="size-8" />
+          </div>
+          <h2 className="font-display mt-4 text-2xl text-foreground">إدخال البيانات متوقف مؤقتاً</h2>
+          <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">
+            أوقف المدير صلاحية إضافة الطلاب وإدخال البيانات للمعلمين حالياً.
+          </p>
+        </section>
+      ) : (
+        <section className="rounded-[2rem] p-6 surface">
+          <h2 className="font-display flex items-center gap-2 text-2xl">
+            <UserPlus className="size-6 text-primary" /> إضافة طالب
+          </h2>
         <p className="mt-1 text-sm text-muted-foreground">
           الاسم والكنية فقط (بدون اسم أب؛ قد يكون الاسم مركباً مثل محمد أمين أو عبد الكريم)
         </p>
@@ -379,7 +405,8 @@ function StudentsPage() {
             </Button>
           </div>
         )}
-      </section>
+        </section>
+      )}
 
       {isAdmin && (
         <section className="mt-6 rounded-[2rem] p-6 surface">

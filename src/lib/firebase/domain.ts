@@ -183,3 +183,9 @@ export function normalizePastAttendanceDates(
     skippedCount,
   };
 }
+
+export const TEACHER_ENTRY_BLOCKED_MESSAGE = "تم إيقاف إدخال البيانات للمعلمين مؤقتاً من قِبل الإدارة";
+
+export function canRoleEnterData(role: StaffRole, teacherEntryEnabled: boolean): boolean {
+  return role === "admin" || teacherEntryEnabled;
+}

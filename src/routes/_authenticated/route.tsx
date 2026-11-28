@@ -75,6 +75,7 @@ function StaffLayout() {
       void qc.invalidateQueries({ queryKey: ["attendance"] });
       void qc.invalidateQueries({ queryKey: ["students"] });
       void qc.invalidateQueries({ queryKey: ["my-day-recordings"] });
+      void qc.invalidateQueries({ queryKey: ["teacher-entry"] });
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);

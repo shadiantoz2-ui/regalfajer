@@ -1,4 +1,4 @@
-/** Admin-only AI assistant: answers questions about students and attendance using read-only data tools. */
+/** Admin-only AI assistant: answers questions about students and attendance using read-only data tools and its dedicated PostgreSQL database. */
 import { createOpenAI } from "@ai-sdk/openai";
 import { GoogleGenAI, ThinkingLevel, Type, type Content, type FunctionDeclaration, type Part } from "@google/genai";
 import {
@@ -14,8 +14,15 @@ import {
 } from "ai";
 import { z } from "zod/v4";
 import { nameSimilarity } from "@/lib/arabic";
+import type { AssistantNoteItem } from "@/lib/assistant-helpers";
+import {
+  createAssistantNote,
+  listAssistantNotes,
+  logAssistantToolRun,
+  saveAssistantConversationMessages,
+} from "@/lib/server/assistant-db.server";
 import { resolveSession, verifySameOriginMutation } from "@/lib/server/auth.server";
-import { listAllAttendance, listStudents, upsertAssistantChatMessages } from "@/lib/server/data.server";
+import { listAllAttendance, listStudents } from "@/lib/server/data.server";
 import {
   createLovableAiGatewayRunIdFetch,
   getLovableAiGatewayRunId,
@@ -31,6 +38,13 @@ const MAX_TOOL_STEPS = 10;
 type Student = { id: string; full_name: string; created_at: string };
 type Att = { student_id: string; attended_on: string };
 type AssistantData = { students: Student[]; attendance: Att[] };
+
+export function isAssistantConfigured(): boolean {
+  const geminiKey = process.env["GEMINI_API_KEY"]?.trim();
+  const rawLovableKey = process.env["LOVABLE_API_KEY"]?.trim();
+  const lovableKey = rawLovableKey && rawLovableKey.length >= 20 ? rawLovableKey : undefined;
+  return Boolean(geminiKey || lovableKey);
+}
 
 function json(status: number, message: string) {
   return Response.json({ error: { message } }, { status });
@@ -68,58 +82,94 @@ function inRange(d: string, from: string | null, to: string | null) {
   return (!from || d >= from) && (!to || d <= to);
 }
 
-function buildToolExecutors(data: () => Promise<AssistantData>) {
-  return {
-    overview: async () => {
-      const { students, attendance } = await data();
-      const perDay = new Map<string, number>();
-      for (const a of attendance) perDay.set(a.attended_on, (perDay.get(a.attended_on) ?? 0) + 1);
-      const days = [...perDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-      return {
-        students: students.length,
-        attendance_records: attendance.length,
-        days_with_attendance: days.length,
-        first_day: days[0]?.[0] ?? null,
-        last_day: days.at(-1)?.[0] ?? null,
-        average_per_day: days.length ? Math.round((attendance.length / days.length) * 10) / 10 : 0,
-        busiest_days: [...days]
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 5)
-          .map(([date, count]) => ({ date, count })),
-      };
-    },
-    find_student: async ({ name }: { name: string }) => {
-      const { students, attendance } = await data();
-      const matches = students
-        .map((s) => ({ s, score: nameSimilarity(name, s.full_name) }))
-        .filter((m) => m.score >= 0.5)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 5);
-      return matches.map(({ s }) => {
-        const dates = attendance
-          .filter((a) => a.student_id === s.id)
-          .map((a) => a.attended_on)
-          .sort();
-        return {
-          full_name: s.full_name,
-          added_on: s.created_at.slice(0, 10),
-          total_days: dates.length,
-          first_day: dates[0] ?? null,
-          last_day: dates.at(-1) ?? null,
-          dates: dates.slice(-120),
-        };
+function buildToolExecutors(
+  data: () => Promise<AssistantData>,
+  context: { userId: string; conversationId: string | null },
+) {
+  async function tracked<T>(
+    toolName: string,
+    args: Record<string, unknown>,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const start = Date.now();
+    try {
+      const result = await fn();
+      void logAssistantToolRun({
+        userId: context.userId,
+        conversationId: context.conversationId,
+        toolName,
+        args,
+        status: "ok",
+        durationMs: Date.now() - start,
       });
-    },
-    attendance_on_date: async ({ date }: { date: string }) => {
-      const { students, attendance } = await data();
-      const present = new Set(attendance.filter((a) => a.attended_on === date).map((a) => a.student_id));
-      return {
-        date,
-        present_count: present.size,
-        present: students.filter((s) => present.has(s.id)).map((s) => s.full_name),
-        absent: students.filter((s) => !present.has(s.id)).map((s) => s.full_name),
-      };
-    },
+      return result;
+    } catch (err) {
+      void logAssistantToolRun({
+        userId: context.userId,
+        conversationId: context.conversationId,
+        toolName,
+        args,
+        status: "error",
+        durationMs: Date.now() - start,
+      });
+      throw err;
+    }
+  }
+
+  return {
+    overview: async () =>
+      tracked("overview", {}, async () => {
+        const { students, attendance } = await data();
+        const perDay = new Map<string, number>();
+        for (const a of attendance) perDay.set(a.attended_on, (perDay.get(a.attended_on) ?? 0) + 1);
+        const days = [...perDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+        return {
+          students: students.length,
+          attendance_records: attendance.length,
+          days_with_attendance: days.length,
+          first_day: days[0]?.[0] ?? null,
+          last_day: days.at(-1)?.[0] ?? null,
+          average_per_day: days.length ? Math.round((attendance.length / days.length) * 10) / 10 : 0,
+          busiest_days: [...days]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5)
+            .map(([date, count]) => ({ date, count })),
+        };
+      }),
+    find_student: async ({ name }: { name: string }) =>
+      tracked("find_student", { name }, async () => {
+        const { students, attendance } = await data();
+        const matches = students
+          .map((s) => ({ s, score: nameSimilarity(name, s.full_name) }))
+          .filter((m) => m.score >= 0.5)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5);
+        return matches.map(({ s }) => {
+          const dates = attendance
+            .filter((a) => a.student_id === s.id)
+            .map((a) => a.attended_on)
+            .sort();
+          return {
+            full_name: s.full_name,
+            added_on: s.created_at.slice(0, 10),
+            total_days: dates.length,
+            first_day: dates[0] ?? null,
+            last_day: dates.at(-1) ?? null,
+            dates: dates.slice(-120),
+          };
+        });
+      }),
+    attendance_on_date: async ({ date }: { date: string }) =>
+      tracked("attendance_on_date", { date }, async () => {
+        const { students, attendance } = await data();
+        const present = new Set(attendance.filter((a) => a.attended_on === date).map((a) => a.student_id));
+        return {
+          date,
+          present_count: present.size,
+          present: students.filter((s) => present.has(s.id)).map((s) => s.full_name),
+          absent: students.filter((s) => !present.has(s.id)).map((s) => s.full_name),
+        };
+      }),
     ranking: async ({
       from,
       to,
@@ -130,27 +180,50 @@ function buildToolExecutors(data: () => Promise<AssistantData>) {
       to: string | null;
       order: "most" | "least";
       limit: number | null;
-    }) => {
-      const { students, attendance } = await data();
-      const counts = new Map<string, number>();
-      for (const a of attendance) {
-        if (inRange(a.attended_on, from, to)) counts.set(a.student_id, (counts.get(a.student_id) ?? 0) + 1);
-      }
-      const rows = students
-        .map((s) => ({ full_name: s.full_name, days: counts.get(s.id) ?? 0 }))
-        .sort((a, b) => (order === "most" ? b.days - a.days : a.days - b.days) || a.full_name.localeCompare(b.full_name, "ar"));
-      return { from, to, total_students: rows.length, rows: rows.slice(0, limit ?? rows.length) };
-    },
-    daily_counts: async ({ from, to }: { from: string | null; to: string | null }) => {
-      const { attendance } = await data();
-      const perDay = new Map<string, number>();
-      for (const a of attendance) {
-        if (inRange(a.attended_on, from, to)) perDay.set(a.attended_on, (perDay.get(a.attended_on) ?? 0) + 1);
-      }
-      return [...perDay.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([date, count]) => ({ date, count }));
-    },
+    }) =>
+      tracked("ranking", { from, to, order, limit }, async () => {
+        const { students, attendance } = await data();
+        const counts = new Map<string, number>();
+        for (const a of attendance) {
+          if (inRange(a.attended_on, from, to)) counts.set(a.student_id, (counts.get(a.student_id) ?? 0) + 1);
+        }
+        const rows = students
+          .map((s) => ({ full_name: s.full_name, days: counts.get(s.id) ?? 0 }))
+          .sort((a, b) => (order === "most" ? b.days - a.days : a.days - b.days) || a.full_name.localeCompare(b.full_name, "ar"));
+        return { from, to, total_students: rows.length, rows: rows.slice(0, limit ?? rows.length) };
+      }),
+    daily_counts: async ({ from, to }: { from: string | null; to: string | null }) =>
+      tracked("daily_counts", { from, to }, async () => {
+        const { attendance } = await data();
+        const perDay = new Map<string, number>();
+        for (const a of attendance) {
+          if (inRange(a.attended_on, from, to)) perDay.set(a.attended_on, (perDay.get(a.attended_on) ?? 0) + 1);
+        }
+        return [...perDay.entries()]
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([date, count]) => ({ date, count }));
+      }),
+    list_notes: async () =>
+      tracked("list_notes", {}, async () => {
+        const notes = await listAssistantNotes(context.userId);
+        return notes.map((n) => ({
+          id: n.id,
+          title: n.title,
+          content: n.content,
+          updated_at: n.updatedAt,
+        }));
+      }),
+    save_note: async ({ title, content }: { title: string; content: string }) =>
+      tracked("save_note", { title }, async () => {
+        const res = await createAssistantNote(context.userId, { title, content });
+        if (!res.ok) throw new Error(res.error);
+        return {
+          saved: true,
+          id: res.note.id,
+          title: res.note.title,
+          content: res.note.content,
+        };
+      }),
   };
 }
 
@@ -187,6 +260,19 @@ function buildAiSdkTools(executors: ReturnType<typeof buildToolExecutors>) {
       description: "Number of students present on each day within an optional date range.",
       inputSchema: z.object({ from: dateArg, to: dateArg }),
       execute: (input) => executors.daily_counts(input),
+    }),
+    list_notes: tool({
+      description: "Read admin notes and reminders saved in the assistant database.",
+      inputSchema: z.object({}),
+      execute: () => executors.list_notes(),
+    }),
+    save_note: tool({
+      description: "Save an admin note or rule into the assistant database when explicitly asked to remember something.",
+      inputSchema: z.object({
+        title: z.string().min(2).max(80),
+        content: z.string().min(2).max(1000),
+      }),
+      execute: (input) => executors.save_note(input),
     }),
   };
 }
@@ -243,10 +329,26 @@ const GEMINI_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
       },
     },
   },
+  {
+    name: "list_notes",
+    description: "Read saved notes and rules from the assistant database.",
+  },
+  {
+    name: "save_note",
+    description: "Save a new note or reminder into the assistant database when the admin asks you to remember something.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        title: { type: Type.STRING, description: "Short title (2-80 chars)" },
+        content: { type: Type.STRING, description: "Note content (2-1000 chars)" },
+      },
+      required: ["title", "content"],
+    },
+  },
 ];
 
-function instructions(today: string) {
-  return [
+function instructions(today: string, notes: readonly AssistantNoteItem[] = []) {
+  const base = [
     "أنت «مساعد رجال الفجر»، مساعد ذكي لمدير موقع تسجيل حضور طلاب صلاة الفجر (رجال الفجر - مسجد الغفران).",
     `تاريخ اليوم: ${today}.`,
     "أجب بالعربية وباختصار ووضوح، واكتب كل الأرقام والتواريخ بالأرقام الإنجليزية (0-9).",
@@ -254,8 +356,17 @@ function instructions(today: string) {
     "عند ذكر قوائم طويلة استخدم القوائم أو الجداول بصيغة markdown.",
     "أسماء الطلاب مكونة من الاسم الأول (وقد يكون اسماً مركباً مثل محمد أمين أو عبد الكريم أو زين العابدين) والكنية فقط دون اسم أب.",
     "معلومات عن الموقع: المعلم يسجل حضور اليوم بالصوت ويضيف طلاباً؛ المدير يدير الطلاب (إضافة، تعديل، حذف، وتسجيل عدة أيام حضور سابقة لكل طالب)، ويسجل حضوراً بتاريخ سابق، ويحمّل ملف Excel، ويدير حسابات المعلمين، ويفتح أو يغلق صفحة النتائج العامة.",
-    "لا يمكنك تعديل البيانات؛ إن طُلب منك ذلك فأرشد المدير إلى الصفحة المناسبة.",
-  ].join("\n");
+    "لديك قاعدة بيانات مخصصة للمحادثات والملاحظات؛ يمكنك حفظ ملاحظة للمدير عبر أداة save_note عند طلبه ذلك، أما بيانات الطلاب والحضور فهي للقراءة فقط وتُعدَّل من صفحاتها المخصصة.",
+  ];
+
+  if (notes.length > 0) {
+    base.push(
+      "ملاحظات المدير المحفوظة في قاعدة بيانات المساعد:",
+      ...notes.slice(0, 15).map((n) => `- ${n.title}: ${n.content}`),
+    );
+  }
+
+  return base.join("\n");
 }
 
 function toOptionalDate(value: unknown): string | null {
@@ -296,6 +407,14 @@ async function runToolCall(
         from: toOptionalDate(rawArgs["from"]),
         to: toOptionalDate(rawArgs["to"]),
       });
+    case "list_notes":
+      return executors.list_notes();
+    case "save_note": {
+      const title = typeof rawArgs["title"] === "string" ? rawArgs["title"].trim() : "";
+      const content = typeof rawArgs["content"] === "string" ? rawArgs["content"].trim() : "";
+      if (!title || !content) throw new Error("عنوان الملاحظة ومحتواها مطلوبان");
+      return executors.save_note({ title, content });
+    }
     default:
       throw new Error(`أداة غير معروفة: ${name}`);
   }
@@ -337,27 +456,31 @@ function readableGeminiError(error: unknown): string {
   }
   if (status === 402) return "انتهى رصيد الذكاء الاصطناعي في مساحة العمل.";
   if (status === 429 || /RESOURCE_EXHAUSTED/i.test(msg)) return "طلبات كثيرة، انتظر قليلاً ثم حاول مجدداً.";
-  if (/Firestore REST/i.test(msg)) return "تعذّر قراءة بيانات الطلاب والحضور من قاعدة البيانات.";
+  if (/قاعدة البيانات|PostgreSQL|ECONNREFUSED/i.test(msg)) {
+    return "تعذّر قراءة بيانات الطلاب والحضور من قاعدة البيانات.";
+  }
   return "تعذّر الحصول على إجابة، حاول مرة أخرى.";
 }
 
 async function handleWithGemini(
   geminiKey: string,
   auth: { userId: string },
+  conversationId: string | null,
   messages: UIMessage[],
   today: string,
+  notes: readonly AssistantNoteItem[],
   signal: AbortSignal,
 ): Promise<Response> {
   const ai = new GoogleGenAI({
     apiKey: geminiKey,
     httpOptions: { headers: { "User-Agent": "aistudio-build" } },
   });
-  const executors = buildToolExecutors(dataLoader());
+  const executors = buildToolExecutors(dataLoader(), { userId: auth.userId, conversationId });
   const contents = convertUIMessagesToGeminiContents(messages);
   if (contents.length === 0) {
     return json(400, "الرسالة فارغة");
   }
-  const systemInstruction = instructions(today);
+  const systemInstruction = instructions(today, notes);
 
   const stream = createUIMessageStream({
     originalMessages: messages,
@@ -382,7 +505,7 @@ async function handleWithGemini(
         const modelParts: Part[] = [];
         const pendingToolCalls: Array<{
           uiId: string;
-          geminiId?: string;
+          geminiId?: string | undefined;
           name: string;
           args: Record<string, unknown>;
         }> = [];
@@ -478,7 +601,7 @@ async function handleWithGemini(
     onFinish: async ({ messages: all }) => {
       if (all.length === 0 || all.at(-1)?.role !== "assistant") return;
       try {
-        await upsertAssistantChatMessages(auth.userId, all);
+        await saveAssistantConversationMessages(auth.userId, conversationId, all);
       } catch (error) {
         console.error("assistant: failed to save conversation", error);
       }
@@ -504,10 +627,10 @@ export async function handleAssistant(request: Request): Promise<Response> {
   const lovableKey = rawLovableKey && rawLovableKey.length >= 20 ? rawLovableKey : undefined;
 
   if (!geminiKey && !lovableKey) {
-    return json(503, "خدمة المساعد غير مفعّلة: تأكد من إضافة GEMINI_API_KEY في الإعدادات");
+    return json(503, "خدمة المساعد غير مفعّلة: أضف GEMINI_API_KEY في الإعدادات (Settings > Secrets)");
   }
 
-  let body: { messages?: unknown; today?: unknown };
+  let body: { messages?: unknown; today?: unknown; conversationId?: unknown };
   try {
     body = await request.json();
   } catch {
@@ -520,9 +643,15 @@ export async function handleAssistant(request: Request): Promise<Response> {
     return json(400, "رسائل غير صالحة");
   }
   const today = typeof body.today === "string" && DATE_RE.test(body.today) ? body.today : new Date().toISOString().slice(0, 10);
+  const conversationId =
+    typeof body.conversationId === "string" && body.conversationId.trim().length > 0 && body.conversationId.trim().length <= 128
+      ? body.conversationId.trim()
+      : null;
+
+  const notes = await listAssistantNotes(auth.userId).catch(() => [] as AssistantNoteItem[]);
 
   if (geminiKey) {
-    return handleWithGemini(geminiKey, auth, messages, today, request.signal);
+    return handleWithGemini(geminiKey, auth, conversationId, messages, today, notes, request.signal);
   }
 
   const runIdFetch = createLovableAiGatewayRunIdFetch(getLovableAiGatewayRunId(request));
@@ -533,10 +662,10 @@ export async function handleAssistant(request: Request): Promise<Response> {
     fetch: runIdFetch.fetch,
   });
 
-  const executors = buildToolExecutors(dataLoader());
+  const executors = buildToolExecutors(dataLoader(), { userId: auth.userId, conversationId });
   const result = streamText({
     model: provider.responses(GATEWAY_MODEL),
-    instructions: instructions(today),
+    instructions: instructions(today, notes),
     messages: await convertToModelMessages(messages),
     tools: buildAiSdkTools(executors),
     stopWhen: isStepCount(20),
@@ -557,8 +686,9 @@ export async function handleAssistant(request: Request): Promise<Response> {
       originalMessages: messages,
       sendReasoning: true,
       onFinish: async ({ messages: all }) => {
+        if (all.length === 0 || all.at(-1)?.role !== "assistant") return;
         try {
-          await upsertAssistantChatMessages(auth.userId, all);
+          await saveAssistantConversationMessages(auth.userId, conversationId, all);
         } catch (error) {
           console.error("assistant: failed to save conversation", error);
         }

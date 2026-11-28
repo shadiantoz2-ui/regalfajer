@@ -72,12 +72,20 @@ export async function ensureInitialDataSeeded(): Promise<void> {
       const nowIso = new Date().toISOString();
       await db
         .insert(appSettings)
-        .values({
-          key: "results_public",
-          value: "false",
-          updatedAt: nowIso,
-          updatedById: null,
-        })
+        .values([
+          {
+            key: "results_public",
+            value: "false",
+            updatedAt: nowIso,
+            updatedById: null,
+          },
+          {
+            key: "teacher_entry_enabled",
+            value: "true",
+            updatedAt: nowIso,
+            updatedById: null,
+          },
+        ])
         .onConflictDoNothing({ target: appSettings.key });
 
       const seededRow = await db

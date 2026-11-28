@@ -1,7 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { canRoleEnterData, TEACHER_ENTRY_BLOCKED_MESSAGE } from "@/lib/firebase/domain";
 import { resolveSession, verifySameOriginMutation } from "@/lib/server/auth.server";
 import {
   deleteAttendance,
+  getTeacherEntryEnabled,
   listAllAttendance,
   listDayAttendance,
   listStudentAttendance,
@@ -53,6 +55,9 @@ export const Route = createFileRoute("/api/attendance")({
         try {
           const session = await resolveSession(request);
           if (!session) return jsonError(401, "انتهت الجلسة، سجّل الدخول أولاً");
+          if (!canRoleEnterData(session.role, await getTeacherEntryEnabled())) {
+            return jsonError(403, TEACHER_ENTRY_BLOCKED_MESSAGE);
+          }
 
           let body: Record<string, unknown>;
           try {

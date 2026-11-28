@@ -146,7 +146,15 @@ export const dayAttendanceQuery = (date: string) =>
 export const settingsQuery = () =>
   queryOptions({
     queryKey: ["settings"],
-    queryFn: () => apiJson<{ results_public: boolean }>("/api/settings"),
+    queryFn: () => apiJson<{ results_public: boolean; teacher_entry_enabled: boolean }>("/api/settings"),
+  });
+
+export const teacherEntryQuery = () =>
+  queryOptions({
+    queryKey: ["teacher-entry"],
+    queryFn: () => apiJson<{ teacher_entry_enabled: boolean }>("/api/settings?entry=1"),
+    staleTime: 10_000,
+    refetchInterval: 30_000,
   });
 
 export const publicResultsQuery = () =>
@@ -158,9 +166,16 @@ export const publicResultsQuery = () =>
   });
 
 export async function setResultsPublic(value: boolean) {
-  await apiJson<{ ok: true; results_public: boolean }>("/api/settings", {
+  await apiJson<{ ok: true; results_public: boolean; teacher_entry_enabled: boolean }>("/api/settings", {
     method: "PUT",
     body: JSON.stringify({ results_public: value }),
+  });
+}
+
+export async function setTeacherEntryEnabledApi(value: boolean) {
+  await apiJson<{ ok: true; results_public: boolean; teacher_entry_enabled: boolean }>("/api/settings", {
+    method: "PUT",
+    body: JSON.stringify({ teacher_entry_enabled: value }),
   });
 }
 
@@ -174,6 +189,15 @@ export async function addStudent(
   return apiJson("/api/students", {
     method: "POST",
     body: JSON.stringify({ fullName: rawName }),
+  });
+}
+
+export async function addStudentsBulk(
+  names: readonly string[],
+): Promise<{ created: Student[]; duplicates: string[] }> {
+  return apiJson("/api/students", {
+    method: "POST",
+    body: JSON.stringify({ mode: "bulk", names }),
   });
 }
 
@@ -211,12 +235,26 @@ export async function recordAttendance(
     method: "POST",
     body: JSON.stringify({ mode: "single", studentId: student.id, date }),
   });
-  await Promise.all([
-    qc.invalidateQueries({ queryKey: ["attendance", date] }),
-    qc.invalidateQueries({ queryKey: ["my-day-recordings", date] }),
-    qc.invalidateQueries({ queryKey: ["student-attendance", student.id] }),
-    qc.invalidateQueries({ queryKey: ["public-results"] }),
-  ]);
+
+  if (res.status === "recorded") {
+    const nowIso = new Date().toISOString();
+    const optimisticRow: DayRow = {
+      id: `${date}_${student.id}`,
+      student_id: student.id,
+      full_name: student.full_name,
+      created_at: nowIso,
+    };
+    qc.setQueryData<DayRow[]>(["attendance", date], (prev) => {
+      if (!prev) return prev;
+      if (prev.some((r) => r.student_id === student.id)) return prev;
+      return [optimisticRow, ...prev];
+    });
+  }
+
+  void qc.invalidateQueries({ queryKey: ["attendance", date] });
+  void qc.invalidateQueries({ queryKey: ["my-day-recordings", date] });
+  void qc.invalidateQueries({ queryKey: ["student-attendance", student.id] });
+  void qc.invalidateQueries({ queryKey: ["public-results"] });
   return res.status;
 }
 
@@ -229,12 +267,10 @@ export async function recordAttendanceBulk(
     method: "POST",
     body: JSON.stringify({ mode: "bulk", studentIds, date }),
   });
-  await Promise.all([
-    qc.invalidateQueries({ queryKey: ["attendance", date] }),
-    qc.invalidateQueries({ queryKey: ["my-day-recordings", date] }),
-    qc.invalidateQueries({ queryKey: ["student-attendance"] }),
-    qc.invalidateQueries({ queryKey: ["public-results"] }),
-  ]);
+  void qc.invalidateQueries({ queryKey: ["attendance", date] });
+  void qc.invalidateQueries({ queryKey: ["my-day-recordings", date] });
+  void qc.invalidateQueries({ queryKey: ["student-attendance"] });
+  void qc.invalidateQueries({ queryKey: ["public-results"] });
   return res;
 }
 
@@ -264,10 +300,8 @@ export async function recordStudentPastDates(
     method: "POST",
     body: JSON.stringify({ mode: "past_dates", studentId: student.id, dates, maxDate }),
   });
-  await Promise.all([
-    qc.invalidateQueries({ queryKey: ["attendance"] }),
-    qc.invalidateQueries({ queryKey: ["student-attendance", student.id] }),
-    qc.invalidateQueries({ queryKey: ["public-results"] }),
-  ]);
+  void qc.invalidateQueries({ queryKey: ["attendance"] });
+  void qc.invalidateQueries({ queryKey: ["student-attendance", student.id] });
+  void qc.invalidateQueries({ queryKey: ["public-results"] });
   return res;
 }

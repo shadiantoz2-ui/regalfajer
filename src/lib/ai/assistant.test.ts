@@ -1,5 +1,12 @@
 import type { UIMessage } from "ai";
 import { describe, expect, it } from "vitest";
+import {
+  deriveConversationTitle,
+  deriveLastMessagePreview,
+  extractMessageText,
+  normalizeStoredMessageRows,
+  validateAssistantNoteInput,
+} from "../assistant-helpers";
 import { convertUIMessagesToGeminiContents, handleAssistant } from "./assistant.server";
 
 describe("Assistant Gemini adapter", () => {
@@ -71,5 +78,38 @@ describe("Assistant Gemini adapter", () => {
     expect(convertUIMessagesToGeminiContents(messages)).toEqual([
       { role: "user", parts: [{ text: "السؤال الأول" }, { text: "السؤال الثاني" }] },
     ]);
+  });
+
+  it("extracts text, derives conversation metadata, validates notes, and normalizes stored message rows", () => {
+    const msgs: UIMessage[] = [
+      { id: "m1", role: "user", parts: [{ type: "text", text: "من أكثر الطلاب حضوراً؟" }] },
+      { id: "m2", role: "assistant", parts: [{ type: "text", text: "حمزة الغربي في الصدارة." }] },
+    ];
+    expect(extractMessageText(msgs[0]?.parts)).toBe("من أكثر الطلاب حضوراً؟");
+    expect(deriveConversationTitle(msgs)).toBe("من أكثر الطلاب حضوراً؟");
+    expect(deriveLastMessagePreview(msgs)).toBe("حمزة الغربي في الصدارة.");
+    expect(validateAssistantNoteInput({ title: "أ", content: "ملاحظة" }).ok).toBe(false);
+    expect(validateAssistantNoteInput({ title: "قاعدة", content: "تفاصيل القاعدة" })).toEqual({
+      ok: true,
+      title: "قاعدة",
+      content: "تفاصيل القاعدة",
+    });
+
+    const normalized = normalizeStoredMessageRows([
+      {
+        id: "c1:m1",
+        role: "user",
+        textContent: "مرحبا",
+        partsJson: JSON.stringify([{ type: "text", text: "مرحبا" }]),
+      },
+      {
+        id: "c1:m2",
+        role: "assistant",
+        textContent: "أهلاً",
+        partsJson: "corrupted",
+      },
+    ]);
+    expect(normalized).toHaveLength(2);
+    expect(normalized[1]?.parts).toEqual([{ type: "text", text: "أهلاً" }]);
   });
 });

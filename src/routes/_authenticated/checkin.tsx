@@ -1,12 +1,20 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { Suspense, useEffect, useState } from "react";
-import { Download, Loader2, Sunrise } from "lucide-react";
+import { Download, Loader2, Lock, Sunrise } from "lucide-react";
 import { toast } from "sonner";
 import { AppShell } from "@/components/AppShell";
 import { VoiceNamePicker } from "@/components/VoiceNamePicker";
 import { Button } from "@/components/ui/button";
-import { addStudent, dayAttendanceQuery, myDayRecordingsQuery, recordAttendance, studentsQuery } from "@/lib/data";
+import { ApiError } from "@/lib/api-client";
+import {
+  addStudent,
+  dayAttendanceQuery,
+  myDayRecordingsQuery,
+  recordAttendance,
+  studentsQuery,
+  teacherEntryQuery,
+} from "@/lib/data";
 import { formatDateLong, localDateKey } from "@/lib/arabic";
 
 export const Route = createFileRoute("/_authenticated/checkin")({
@@ -23,6 +31,8 @@ export const Route = createFileRoute("/_authenticated/checkin")({
   loader: ({ context }) => {
     if (context.role === "admin") {
       void context.queryClient.prefetchQuery(dayAttendanceQuery(localDateKey()));
+    } else {
+      void context.queryClient.prefetchQuery(teacherEntryQuery());
     }
     return context.queryClient.ensureQueryData(studentsQuery());
   },
@@ -41,10 +51,12 @@ function useToday() {
 function CheckIn() {
   const { role, userName } = Route.useRouteContext();
   const { data: students } = useSuspenseQuery(studentsQuery());
+  const entrySetting = useQuery({ ...teacherEntryQuery(), enabled: role === "teacher" });
   const today = useToday();
   const qc = useQueryClient();
 
   const showWelcome = role === "teacher" || (role === "admin" && Boolean(userName));
+  const teacherEntryBlocked = role === "teacher" && entrySetting.data?.teacher_entry_enabled === false;
 
   return (
     <AppShell role={role} userName={userName}>
@@ -60,24 +72,48 @@ function CheckIn() {
         <span className="text-base">{formatDateLong(today)}</span>
       </div>
 
-      <VoiceNamePicker
-        students={students}
-        onConfirm={async (s) => {
-          const date = localDateKey();
-          const res = await recordAttendance(qc, s, date);
-          if (res === "recorded") {
-            void qc.invalidateQueries({ queryKey: ["my-day-recordings", date] });
-          }
-          return res;
-        }}
-        onRegister={async (name) => {
-          const res = await addStudent(name);
-          void qc.invalidateQueries({ queryKey: ["students"] });
-          if (res.status === "invalid") throw new Error("invalid");
-          return res;
-        }}
-        duplicateText={(n) => `${n} — تم تسجيل حضوره اليوم مسبقاً`}
-      />
+      {teacherEntryBlocked ? (
+        <div role="status" className="rounded-[2rem] border border-destructive/40 p-8 text-center surface">
+          <div className="mx-auto grid size-16 place-items-center rounded-full border border-destructive/40 bg-destructive/15 text-destructive">
+            <Lock className="size-8" />
+          </div>
+          <h2 className="font-display mt-4 text-2xl text-foreground">إدخال البيانات متوقف مؤقتاً</h2>
+          <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">
+            أوقف المدير صلاحية تسجيل الحضور وإضافة الطلاب للمعلمين حالياً. يمكنك المتابعة بعد إعادة تفعيلها من الإدارة.
+          </p>
+        </div>
+      ) : (
+        <VoiceNamePicker
+          students={students}
+          onConfirm={async (s) => {
+            try {
+              const date = localDateKey();
+              return await recordAttendance(qc, s, date);
+            } catch (err) {
+              if (err instanceof ApiError && err.status === 403) {
+                void qc.invalidateQueries({ queryKey: ["teacher-entry"] });
+                toast.error(err.message);
+              }
+              throw err;
+            }
+          }}
+          onRegister={async (name) => {
+            try {
+              const res = await addStudent(name);
+              void qc.invalidateQueries({ queryKey: ["students"] });
+              if (res.status === "invalid") throw new Error("invalid");
+              return res;
+            } catch (err) {
+              if (err instanceof ApiError && err.status === 403) {
+                void qc.invalidateQueries({ queryKey: ["teacher-entry"] });
+                toast.error(err.message);
+              }
+              throw err;
+            }
+          }}
+          duplicateText={(n) => `${n} — تم تسجيل حضوره اليوم مسبقاً`}
+        />
+      )}
 
       {role === "admin" && (
         <Suspense fallback={<div className="mt-8 h-32 animate-pulse rounded-[2rem] surface" />}>

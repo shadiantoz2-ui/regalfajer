@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm";
-import { boolean, index, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { boolean, index, integer, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const staffAccounts = pgTable("staff_accounts", {
   id: text("id").primaryKey(),
@@ -60,6 +60,78 @@ export const assistantChats = pgTable("assistant_chats", {
   updatedAt: text("updated_at").notNull(),
 });
 
+export const assistantConversations = pgTable(
+  "assistant_conversations",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => staffAccounts.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    messageCount: integer("message_count").notNull().default(0),
+    lastMessagePreview: text("last_message_preview").notNull().default(""),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("idx_assistant_conv_user_updated").on(table.userId, table.updatedAt)],
+);
+
+export const assistantMessages = pgTable(
+  "assistant_messages",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => assistantConversations.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => staffAccounts.id, { onDelete: "cascade" }),
+    role: text("role").notNull(),
+    textContent: text("text_content").notNull(),
+    partsJson: text("parts_json").notNull(),
+    position: integer("position").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    index("idx_assistant_msg_conv_pos").on(table.conversationId, table.position),
+    index("idx_assistant_msg_user").on(table.userId),
+  ],
+);
+
+export const assistantToolLogs = pgTable(
+  "assistant_tool_logs",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id").references(() => assistantConversations.id, {
+      onDelete: "set null",
+    }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => staffAccounts.id, { onDelete: "cascade" }),
+    toolName: text("tool_name").notNull(),
+    inputJson: text("input_json").notNull(),
+    status: text("status").notNull(),
+    durationMs: integer("duration_ms").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [index("idx_assistant_tool_user_created").on(table.userId, table.createdAt)],
+);
+
+export const assistantNotes = pgTable(
+  "assistant_notes",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => staffAccounts.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    content: text("content").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("idx_assistant_notes_user_updated").on(table.userId, table.updatedAt)],
+);
+
 export const systemConfig = pgTable("system_config", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),
@@ -76,16 +148,58 @@ export const attendanceRelations = relations(attendance, ({ one }) => ({
   }),
 }));
 
-export const staffAccountsRelations = relations(staffAccounts, ({ one }) => ({
+export const staffAccountsRelations = relations(staffAccounts, ({ one, many }) => ({
   assistantChat: one(assistantChats, {
     fields: [staffAccounts.id],
     references: [assistantChats.userId],
   }),
+  assistantConversations: many(assistantConversations),
+  assistantMessages: many(assistantMessages),
+  assistantToolLogs: many(assistantToolLogs),
+  assistantNotes: many(assistantNotes),
 }));
 
 export const assistantChatsRelations = relations(assistantChats, ({ one }) => ({
   staffAccount: one(staffAccounts, {
     fields: [assistantChats.userId],
+    references: [staffAccounts.id],
+  }),
+}));
+
+export const assistantConversationsRelations = relations(assistantConversations, ({ one, many }) => ({
+  staffAccount: one(staffAccounts, {
+    fields: [assistantConversations.userId],
+    references: [staffAccounts.id],
+  }),
+  messages: many(assistantMessages),
+  toolLogs: many(assistantToolLogs),
+}));
+
+export const assistantMessagesRelations = relations(assistantMessages, ({ one }) => ({
+  conversation: one(assistantConversations, {
+    fields: [assistantMessages.conversationId],
+    references: [assistantConversations.id],
+  }),
+  staffAccount: one(staffAccounts, {
+    fields: [assistantMessages.userId],
+    references: [staffAccounts.id],
+  }),
+}));
+
+export const assistantToolLogsRelations = relations(assistantToolLogs, ({ one }) => ({
+  conversation: one(assistantConversations, {
+    fields: [assistantToolLogs.conversationId],
+    references: [assistantConversations.id],
+  }),
+  staffAccount: one(staffAccounts, {
+    fields: [assistantToolLogs.userId],
+    references: [staffAccounts.id],
+  }),
+}));
+
+export const assistantNotesRelations = relations(assistantNotes, ({ one }) => ({
+  staffAccount: one(staffAccounts, {
+    fields: [assistantNotes.userId],
     references: [staffAccounts.id],
   }),
 }));

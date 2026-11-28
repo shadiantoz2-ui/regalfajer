@@ -4,10 +4,13 @@ import { STAFF_LIMITS, validateStaffAccountInput } from "@/lib/firebase/domain";
 import type { StaffAccountView, StaffRole, StaffSessionUser } from "@/lib/types";
 import { attendance, staffAccounts } from "../../db/schema.ts";
 import { getDb, getOrCreateSessionSecret } from "./db.server";
+import { createSingleflight, TtlCache } from "./request-cache";
 
 export const SESSION_COOKIE_NAME = "rijal_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14;
 const DUMMY_SALT = "0123456789abcdef0123456789abcdef";
+const sessionUserCache = new TtlCache<StaffSessionUser>(20_000, 200);
+const sessionLookupSf = createSingleflight();
 
 function toAccountView(row: {
   id: string;
@@ -199,30 +202,37 @@ export async function resolveSession(request: Request): Promise<StaffSessionUser
   const userId = await verifySessionToken(token);
   if (!userId) return null;
 
+  const cached = sessionUserCache.get(userId);
+  if (cached) return cached;
+
   try {
-    const db = getDb();
-    const rows = await db
-      .select({
-        id: staffAccounts.id,
-        name: staffAccounts.name,
-        username: staffAccounts.username,
-        role: staffAccounts.role,
-        isPrimaryAdmin: staffAccounts.isPrimaryAdmin,
-      })
-      .from(staffAccounts)
-      .where(eq(staffAccounts.id, userId))
-      .limit(1);
+    return await sessionLookupSf.run(`session:${userId}`, async () => {
+      const db = getDb();
+      const rows = await db
+        .select({
+          id: staffAccounts.id,
+          name: staffAccounts.name,
+          username: staffAccounts.username,
+          role: staffAccounts.role,
+          isPrimaryAdmin: staffAccounts.isPrimaryAdmin,
+        })
+        .from(staffAccounts)
+        .where(eq(staffAccounts.id, userId))
+        .limit(1);
 
-    const row = rows[0];
-    if (!row) return null;
+      const row = rows[0];
+      if (!row) return null;
 
-    return {
-      id: row.id,
-      name: row.name,
-      username: row.username,
-      role: row.role === "admin" ? "admin" : "teacher",
-      isPrimaryAdmin: row.isPrimaryAdmin,
-    };
+      const user: StaffSessionUser = {
+        id: row.id,
+        name: row.name,
+        username: row.username,
+        role: row.role === "admin" ? "admin" : "teacher",
+        isPrimaryAdmin: row.isPrimaryAdmin,
+      };
+      sessionUserCache.set(userId, user);
+      return user;
+    });
   } catch (error) {
     console.error("Failed to resolve staff session:", error);
     throw new Error("تعذّر التحقق من الجلسة في قاعدة البيانات", { cause: error });
@@ -528,6 +538,7 @@ export async function updateStaffAccount(
         .where(eq(attendance.recordedById, target.id));
     });
 
+    sessionUserCache.delete(target.id);
     return {
       ok: true,
       account: {
@@ -573,6 +584,7 @@ export async function deleteStaffAccount(
     }
 
     await db.delete(staffAccounts).where(eq(staffAccounts.id, target.id));
+    sessionUserCache.delete(target.id);
     return { ok: true };
   } catch (error) {
     console.error("Failed to delete staff account:", error);

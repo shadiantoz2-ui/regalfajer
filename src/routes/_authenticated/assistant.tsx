@@ -1,11 +1,10 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { useSuspenseQuery } from "@tanstack/react-query";
-import type { UIMessage } from "ai";
 import { type ComponentType, useEffect, useState } from "react";
 import { AppShell } from "@/components/AppShell";
-import { assistantChatQuery } from "@/lib/assistant-chat";
+import { assistantChatQuery, type AssistantChatPayload } from "@/lib/assistant-chat";
 
-type ChatWindowComponent = ComponentType<{ initial: UIMessage[] }>;
+type ChatWindowComponent = ComponentType<{ initialData: AssistantChatPayload }>;
 
 const ChatSkeleton = () => (
   <div className="h-[calc(100dvh-15rem)] min-h-[26rem] animate-pulse rounded-[2rem] surface md:h-[calc(100dvh-17rem)]" />
@@ -31,7 +30,7 @@ export const Route = createFileRoute("/_authenticated/assistant")({
 
 function AssistantPage() {
   const { role, userName } = Route.useRouteContext();
-  const { data: saved } = useSuspenseQuery(assistantChatQuery());
+  const { data: initialData } = useSuspenseQuery(assistantChatQuery());
   const [ChatWindow, setChatWindow] = useState<ChatWindowComponent | null>(null);
 
   useEffect(() => {
@@ -47,7 +46,7 @@ function AssistantPage() {
 
   return (
     <AppShell compact role={role} userName={userName}>
-      {ChatWindow ? <ChatWindow initial={saved} /> : <ChatSkeleton />}
+      {ChatWindow ? <ChatWindow initialData={initialData} /> : <ChatSkeleton />}
     </AppShell>
   );
 }

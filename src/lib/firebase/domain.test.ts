@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   attendanceDocId,
+  canRoleEnterData,
   computePublicLeaderboard,
   emailDocKey,
   normalizePastAttendanceDates,
@@ -102,5 +103,12 @@ describe("Firebase Staff & Attendance Domain", () => {
       validDates: ["2026-11-21", "2026-11-23"],
       skippedCount: 1,
     });
+  });
+
+  it("enforces teacher data entry toggle while always allowing admins", () => {
+    expect(canRoleEnterData("admin", true)).toBe(true);
+    expect(canRoleEnterData("admin", false)).toBe(true);
+    expect(canRoleEnterData("teacher", true)).toBe(true);
+    expect(canRoleEnterData("teacher", false)).toBe(false);
   });
 });

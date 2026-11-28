@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, lte, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from "drizzle-orm";
 import {
   computePublicLeaderboard,
   normalizePastAttendanceDates,
@@ -7,8 +7,18 @@ import {
   validateStudentDisplayName,
 } from "@/lib/firebase/domain";
 import type { AttendanceRow, StaffRecordingItem, StaffSessionUser, Student } from "@/lib/types";
-import { appSettings, assistantChats, attendance, students } from "../../db/schema.ts";
+import { appSettings, attendance, students } from "../../db/schema.ts";
 import { ensureInitialDataSeeded, getDb } from "./db.server";
+import { createSingleflight, TtlCache } from "./request-cache";
+
+const dataSf = createSingleflight();
+const leaderboardCache = new TtlCache<{ open: boolean; rows: { full_name: string; days: number }[] }>(10_000, 4);
+const settingsPublicCache = new TtlCache<boolean>(10_000, 4);
+const settingsEntryCache = new TtlCache<boolean>(2_000, 4);
+
+function invalidateLeaderboardCaches() {
+  leaderboardCache.clear();
+}
 
 export type DayRow = {
   id: string;
@@ -18,21 +28,23 @@ export type DayRow = {
 };
 
 export async function listStudents(): Promise<Student[]> {
-  await ensureInitialDataSeeded();
-  try {
-    const db = getDb();
-    const rows = await db
-      .select({
-        id: students.id,
-        full_name: students.fullName,
-        created_at: students.createdAt,
-      })
-      .from(students);
-    return rows.sort((a, b) => a.full_name.localeCompare(b.full_name, "ar"));
-  } catch (error) {
-    console.error("Failed to list students:", error);
-    throw new Error("تعذّر تحميل قائمة الطلاب", { cause: error });
-  }
+  return dataSf.run("students:list", async () => {
+    await ensureInitialDataSeeded();
+    try {
+      const db = getDb();
+      const rows = await db
+        .select({
+          id: students.id,
+          full_name: students.fullName,
+          created_at: students.createdAt,
+        })
+        .from(students);
+      return rows.sort((a, b) => a.full_name.localeCompare(b.full_name, "ar"));
+    } catch (error) {
+      console.error("Failed to list students:", error);
+      throw new Error("تعذّر تحميل قائمة الطلاب", { cause: error });
+    }
+  });
 }
 
 export async function addStudent(
@@ -75,10 +87,73 @@ export async function addStudent(
       updatedAt: nowIso,
     });
 
+    invalidateLeaderboardCaches();
     return { status: "created", student: { id, full_name, created_at: nowIso } };
   } catch (error) {
     console.error("Failed to add student:", error);
     throw new Error("تعذّر إضافة الطالب", { cause: error });
+  }
+}
+
+export async function addStudentsBulk(
+  rawNames: readonly string[],
+  actorId: string,
+): Promise<{ created: Student[]; duplicates: string[] }> {
+  await ensureInitialDataSeeded();
+  const deduped = new Map<string, string>();
+  for (const raw of rawNames) {
+    const { valid, full_name, normalized_name } = validateStudentDisplayName(raw);
+    if (!valid) continue;
+    if (!deduped.has(normalized_name)) {
+      deduped.set(normalized_name, full_name);
+    }
+  }
+  if (deduped.size === 0) {
+    return { created: [], duplicates: [] };
+  }
+
+  try {
+    const db = getDb();
+    const normKeys = Array.from(deduped.keys());
+    const existingRows = await db
+      .select({ normalizedName: students.normalizedName })
+      .from(students)
+      .where(inArray(students.normalizedName, normKeys));
+
+    const existingSet = new Set(existingRows.map((r) => r.normalizedName));
+    const duplicates: string[] = [];
+    const toInsert: Array<typeof students.$inferInsert> = [];
+    const createdStudents: Student[] = [];
+    const nowIso = new Date().toISOString();
+
+    for (const [norm, fullName] of deduped.entries()) {
+      if (existingSet.has(norm)) {
+        duplicates.push(fullName);
+        continue;
+      }
+      const id = randomUUID();
+      toInsert.push({
+        id,
+        fullName,
+        normalizedName: norm,
+        createdById: actorId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+      createdStudents.push({ id, full_name: fullName, created_at: nowIso });
+    }
+
+    if (toInsert.length > 0) {
+      await db.insert(students).values(toInsert).onConflictDoNothing({
+        target: students.normalizedName,
+      });
+      invalidateLeaderboardCaches();
+    }
+
+    return { created: createdStudents, duplicates };
+  } catch (error) {
+    console.error("Failed to add students in bulk:", error);
+    throw new Error("تعذّر إضافة قائمة الطلاب", { cause: error });
   }
 }
 
@@ -127,6 +202,7 @@ export async function renameStudent(
         .where(eq(attendance.studentId, id));
     });
 
+    invalidateLeaderboardCaches();
     return { status: "renamed" };
   } catch (error) {
     console.error("Failed to rename student:", error);
@@ -142,6 +218,7 @@ export async function deleteStudent(id: string): Promise<boolean> {
       .delete(students)
       .where(eq(students.id, id))
       .returning({ id: students.id });
+    if (deleted.length > 0) invalidateLeaderboardCaches();
     return deleted.length > 0;
   } catch (error) {
     console.error("Failed to delete student:", error);
@@ -151,23 +228,25 @@ export async function deleteStudent(id: string): Promise<boolean> {
 
 export async function listDayAttendance(date: string): Promise<DayRow[]> {
   if (!STAFF_LIMITS.DATE_PATTERN.test(date)) return [];
-  await ensureInitialDataSeeded();
-  try {
-    const db = getDb();
-    return await db
-      .select({
-        id: attendance.id,
-        student_id: attendance.studentId,
-        full_name: attendance.studentName,
-        created_at: attendance.createdAt,
-      })
-      .from(attendance)
-      .where(eq(attendance.attendedOn, date))
-      .orderBy(desc(attendance.createdAt));
-  } catch (error) {
-    console.error("Failed to list day attendance:", error);
-    throw new Error("تعذّر تحميل حضور اليوم", { cause: error });
-  }
+  return dataSf.run(`attendance:day:${date}`, async () => {
+    await ensureInitialDataSeeded();
+    try {
+      const db = getDb();
+      return await db
+        .select({
+          id: attendance.id,
+          student_id: attendance.studentId,
+          full_name: attendance.studentName,
+          created_at: attendance.createdAt,
+        })
+        .from(attendance)
+        .where(eq(attendance.attendedOn, date))
+        .orderBy(desc(attendance.createdAt));
+    } catch (error) {
+      console.error("Failed to list day attendance:", error);
+      throw new Error("تعذّر تحميل حضور اليوم", { cause: error });
+    }
+  });
 }
 
 export async function listStudentAttendance(studentId: string): Promise<AttendanceRow[]> {
@@ -224,27 +303,29 @@ export async function listAllAttendance(from?: string, to?: string): Promise<Att
 
 export async function listStaffDayRecordings(staffId: string, date: string): Promise<StaffRecordingItem[]> {
   if (!staffId || !STAFF_LIMITS.DATE_PATTERN.test(date)) return [];
-  await ensureInitialDataSeeded();
-  try {
-    const db = getDb();
-    return await db
-      .select({
-        id: attendance.id,
-        teacherId: attendance.recordedById,
-        teacherUsername: attendance.recordedByUsername,
-        teacherName: attendance.recordedByName,
-        studentId: attendance.studentId,
-        studentName: attendance.studentName,
-        attendedOn: attendance.attendedOn,
-        recordedAt: attendance.createdAt,
-      })
-      .from(attendance)
-      .where(and(eq(attendance.recordedById, staffId), eq(attendance.attendedOn, date)))
-      .orderBy(desc(attendance.createdAt));
-  } catch (error) {
-    console.error("Failed to list staff day recordings:", error);
-    throw new Error("تعذّر تحميل تسجيلات الحضور", { cause: error });
-  }
+  return dataSf.run(`attendance:staff:${staffId}:${date}`, async () => {
+    await ensureInitialDataSeeded();
+    try {
+      const db = getDb();
+      return await db
+        .select({
+          id: attendance.id,
+          teacherId: attendance.recordedById,
+          teacherUsername: attendance.recordedByUsername,
+          teacherName: attendance.recordedByName,
+          studentId: attendance.studentId,
+          studentName: attendance.studentName,
+          attendedOn: attendance.attendedOn,
+          recordedAt: attendance.createdAt,
+        })
+        .from(attendance)
+        .where(and(eq(attendance.recordedById, staffId), eq(attendance.attendedOn, date)))
+        .orderBy(desc(attendance.createdAt));
+    } catch (error) {
+      console.error("Failed to list staff day recordings:", error);
+      throw new Error("تعذّر تحميل تسجيلات الحضور", { cause: error });
+    }
+  });
 }
 
 export async function recordAttendance(
@@ -259,33 +340,44 @@ export async function recordAttendance(
 
   try {
     const db = getDb();
-    const studentRows = await db
-      .select({ id: students.id, fullName: students.fullName })
-      .from(students)
-      .where(eq(students.id, studentId))
-      .limit(1);
-
-    const student = studentRows[0];
-    if (!student) return { status: "not_found" };
-
-    const attId = `${attendedOn}_${student.id}`;
     const nowIso = new Date().toISOString();
-    const inserted = await db
-      .insert(attendance)
-      .values({
-        id: attId,
-        studentId: student.id,
-        studentName: student.fullName,
-        attendedOn,
-        recordedById: actor.id,
-        recordedByName: actor.name,
-        recordedByUsername: actor.username,
-        createdAt: nowIso,
-      })
-      .onConflictDoNothing()
-      .returning({ id: attendance.id });
+    const res = await db.execute<{ found_count: number; inserted_count: number }>(sql`
+      WITH target AS (
+        SELECT ${students.id} AS id, ${students.fullName} AS full_name
+        FROM ${students}
+        WHERE ${students.id} = ${studentId}
+        LIMIT 1
+      ),
+      ins AS (
+        INSERT INTO ${attendance} (
+          id, student_id, student_name, attended_on,
+          recorded_by_id, recorded_by_name, recorded_by_username, created_at
+        )
+        SELECT
+          ${attendedOn} || '_' || target.id,
+          target.id,
+          target.full_name,
+          ${attendedOn},
+          ${actor.id},
+          ${actor.name},
+          ${actor.username},
+          ${nowIso}
+        FROM target
+        ON CONFLICT (student_id, attended_on) DO NOTHING
+        RETURNING id
+      )
+      SELECT
+        (SELECT count(*)::int FROM target) AS found_count,
+        (SELECT count(*)::int FROM ins) AS inserted_count
+    `);
 
-    return { status: inserted.length > 0 ? "recorded" : "duplicate" };
+    const row = res.rows[0];
+    if (!row || Number(row.found_count) === 0) return { status: "not_found" };
+    if (Number(row.inserted_count) > 0) {
+      invalidateLeaderboardCaches();
+      return { status: "recorded" };
+    }
+    return { status: "duplicate" };
   } catch (error) {
     console.error("Failed to record attendance:", error);
     throw new Error("تعذّر تسجيل الحضور", { cause: error });
@@ -346,6 +438,7 @@ export async function recordAttendanceBulk(
       .returning({ id: attendance.id });
 
     const recorded = inserted.length;
+    if (recorded > 0) invalidateLeaderboardCaches();
     const skipped = missingCount + (toInsert.length - recorded);
     return { recorded, skipped };
   } catch (error) {
@@ -401,6 +494,7 @@ export async function recordStudentPastDates(
       .onConflictDoNothing()
       .returning({ id: attendance.id });
 
+    if (inserted.length > 0) invalidateLeaderboardCaches();
     return { recorded: inserted.length, skipped: skippedCount + (values.length - inserted.length) };
   } catch (error) {
     if (error instanceof Error && error.message === "الطالب غير موجود") {
@@ -419,6 +513,7 @@ export async function deleteAttendance(id: string): Promise<boolean> {
       .delete(attendance)
       .where(eq(attendance.id, id))
       .returning({ id: attendance.id });
+    if (deleted.length > 0) invalidateLeaderboardCaches();
     return deleted.length > 0;
   } catch (error) {
     console.error("Failed to delete attendance:", error);
@@ -427,19 +522,26 @@ export async function deleteAttendance(id: string): Promise<boolean> {
 }
 
 export async function getResultsPublic(): Promise<boolean> {
-  await ensureInitialDataSeeded();
-  try {
-    const db = getDb();
-    const rows = await db
-      .select({ value: appSettings.value })
-      .from(appSettings)
-      .where(eq(appSettings.key, "results_public"))
-      .limit(1);
-    return rows[0]?.value === "true";
-  } catch (error) {
-    console.error("Failed to read results_public setting:", error);
-    throw new Error("تعذّر قراءة إعدادات النتائج", { cause: error });
-  }
+  const cached = settingsPublicCache.get("results_public");
+  if (cached !== undefined) return cached;
+
+  return dataSf.run("settings:results_public", async () => {
+    await ensureInitialDataSeeded();
+    try {
+      const db = getDb();
+      const rows = await db
+        .select({ value: appSettings.value })
+        .from(appSettings)
+        .where(eq(appSettings.key, "results_public"))
+        .limit(1);
+      const val = rows[0]?.value === "true";
+      settingsPublicCache.set("results_public", val);
+      return val;
+    } catch (error) {
+      console.error("Failed to read results_public setting:", error);
+      throw new Error("تعذّر قراءة إعدادات النتائج", { cause: error });
+    }
+  });
 }
 
 export async function setResultsPublic(value: boolean, actorId: string): Promise<void> {
@@ -464,87 +566,114 @@ export async function setResultsPublic(value: boolean, actorId: string): Promise
           updatedById: actorId,
         },
       });
+    settingsPublicCache.set("results_public", value);
+    invalidateLeaderboardCaches();
   } catch (error) {
     console.error("Failed to update results_public setting:", error);
     throw new Error("تعذّر تحديث إعدادات النتائج", { cause: error });
   }
 }
 
-export async function getPublicLeaderboard(): Promise<{ open: boolean; rows: { full_name: string; days: number }[] }> {
-  const open = await getResultsPublic();
-  if (!open) return { open: false, rows: [] };
+export async function getTeacherEntryEnabled(): Promise<boolean> {
+  const cached = settingsEntryCache.get("teacher_entry_enabled");
+  if (cached !== undefined) return cached;
 
-  try {
-    const db = getDb();
-    const [studentRows, attendanceRows] = await Promise.all([
-      db.select({ id: students.id, full_name: students.fullName }).from(students),
-      db.select({ student_id: attendance.studentId }).from(attendance),
-    ]);
-
-    return {
-      open: true,
-      rows: computePublicLeaderboard(studentRows, attendanceRows),
-    };
-  } catch (error) {
-    console.error("Failed to compute public leaderboard:", error);
-    throw new Error("تعذّر تحميل لوحة النتائج", { cause: error });
-  }
-}
-
-export async function getAssistantChatMessages(userId: string): Promise<unknown[]> {
-  try {
-    const db = getDb();
-    const rows = await db
-      .select({ messages: assistantChats.messages })
-      .from(assistantChats)
-      .where(eq(assistantChats.userId, userId))
-      .limit(1);
-
-    const raw = rows[0]?.messages;
-    if (!raw) return [];
+  return dataSf.run("settings:teacher_entry_enabled", async () => {
+    await ensureInitialDataSeeded();
     try {
-      const parsed = JSON.parse(raw) as unknown;
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
+      const db = getDb();
+      const rows = await db
+        .select({ value: appSettings.value })
+        .from(appSettings)
+        .where(eq(appSettings.key, "teacher_entry_enabled"))
+        .limit(1);
+      const val = rows[0]?.value !== "false";
+      settingsEntryCache.set("teacher_entry_enabled", val);
+      return val;
+    } catch (error) {
+      console.error("Failed to read teacher_entry_enabled setting:", error);
+      throw new Error("تعذّر قراءة إعدادات إدخال المعلمين", { cause: error });
     }
-  } catch (error) {
-    console.error("Failed to fetch assistant chat messages:", error);
-    throw new Error("تعذّر تحميل سجل المساعد", { cause: error });
-  }
+  });
 }
 
-export async function upsertAssistantChatMessages(userId: string, messages: unknown[]): Promise<void> {
+export async function setTeacherEntryEnabled(value: boolean, actorId: string): Promise<void> {
+  await ensureInitialDataSeeded();
   try {
     const db = getDb();
     const nowIso = new Date().toISOString();
-    const serialized = JSON.stringify(messages);
+    const serialized = value ? "true" : "false";
     await db
-      .insert(assistantChats)
+      .insert(appSettings)
       .values({
-        userId,
-        messages: serialized,
+        key: "teacher_entry_enabled",
+        value: serialized,
         updatedAt: nowIso,
+        updatedById: actorId,
       })
       .onConflictDoUpdate({
-        target: assistantChats.userId,
+        target: appSettings.key,
         set: {
-          messages: serialized,
+          value: serialized,
           updatedAt: nowIso,
+          updatedById: actorId,
         },
       });
+    settingsEntryCache.set("teacher_entry_enabled", value);
   } catch (error) {
-    console.error("Failed to save assistant chat messages:", error);
-    throw new Error("تعذّر حفظ محادثة المساعد", { cause: error });
+    console.error("Failed to update teacher_entry_enabled setting:", error);
+    throw new Error("تعذّر تحديث إعدادات إدخال المعلمين", { cause: error });
   }
 }
 
+export async function getPublicLeaderboard(): Promise<{ open: boolean; rows: { full_name: string; days: number }[] }> {
+  const cached = leaderboardCache.get("public");
+  if (cached) return cached;
+
+  return dataSf.run("leaderboard:public", async () => {
+    const open = await getResultsPublic();
+    if (!open) {
+      const closed = { open: false, rows: [] };
+      leaderboardCache.set("public", closed);
+      return closed;
+    }
+
+    try {
+      const db = getDb();
+      const [studentRows, attendanceRows] = await Promise.all([
+        db.select({ id: students.id, full_name: students.fullName }).from(students),
+        db.select({ student_id: attendance.studentId }).from(attendance),
+      ]);
+
+      const payload = {
+        open: true,
+        rows: computePublicLeaderboard(studentRows, attendanceRows),
+      };
+      leaderboardCache.set("public", payload);
+      return payload;
+    } catch (error) {
+      console.error("Failed to compute public leaderboard:", error);
+      throw new Error("تعذّر تحميل لوحة النتائج", { cause: error });
+    }
+  });
+}
+
+export async function getAssistantChatMessages(userId: string): Promise<unknown[]> {
+  const { getAssistantConversationMessages } = await import("./assistant-db.server");
+  const res = await getAssistantConversationMessages(userId);
+  return res.messages;
+}
+
+export async function upsertAssistantChatMessages(
+  userId: string,
+  messages: unknown[],
+  conversationId?: string | null,
+): Promise<void> {
+  const { saveAssistantConversationMessages } = await import("./assistant-db.server");
+  await saveAssistantConversationMessages(userId, conversationId, messages as never);
+}
+
 export async function clearAssistantChatMessages(userId: string): Promise<void> {
-  try {
-    const db = getDb();
-    await db.delete(assistantChats).where(eq(assistantChats.userId, userId));
-  } catch (error) {
-    console.error("Failed to clear assistant chat messages:", error);
-    throw new Error("تعذّر مسح محادثة المساعد", { cause: error });
-  }
+  const { clearAllAssistantConversations } = await import("./assistant-db.server");
+  await clearAllAssistantConversations(userId);
 }
